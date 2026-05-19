@@ -1,0 +1,282 @@
+use crate::ast;
+use crate::lexer::{LexError, Span, Token};
+
+grammar;
+
+pub Source: ast::Source = {
+    <declarations:Declaration*> => ast::Source { declarations }
+};
+
+Declaration: ast::Declaration = {
+    <model:ModelDeclaration> => ast::Declaration::Model(model),
+    <state:StateDeclaration> => ast::Declaration::State(state),
+    <function:FunctionDeclaration> => ast::Declaration::Function(function),
+};
+
+ModelDeclaration: ast::ModelDeclaration = {
+    <start:@L> "model" <name:Identifier> "{" <items:ModelItem*> "}" <end:@R> => {
+        ast::ModelDeclaration {
+            name,
+            items,
+            span: Span::new(start, end),
+        }
+    }
+};
+
+ModelItem: ast::ModelItem = {
+    <field:Field> => ast::ModelItem::Field(field),
+    <constraint:MustBlock> => ast::ModelItem::Constraint(constraint),
+};
+
+StateDeclaration: ast::StateDeclaration = {
+    <start:@L> "state" <name:Identifier> <model:StateModel?> "{"
+    <constraints:MustBlock*> "}" <end:@R> => {
+        ast::StateDeclaration {
+            name,
+            model,
+            constraints,
+            span: Span::new(start, end),
+        }
+    }
+};
+
+StateModel: ast::Identifier = {
+    "(" <model:Identifier> ")" => model,
+};
+
+FunctionDeclaration: ast::FunctionDeclaration = {
+    <start:@L> "fn" <name:Identifier> "(" <params:Parameters> ")"
+    <transition:StateTransition?> "{" <body:Statement*> "}" <end:@R> => {
+        ast::FunctionDeclaration {
+            name,
+            params,
+            transition,
+            body,
+            span: Span::new(start, end),
+        }
+    }
+};
+
+Parameters: Vec<ast::Parameter> = {
+    => Vec::new(),
+    <params:CommaSeparated<Parameter>> => params,
+};
+
+Parameter: ast::Parameter = {
+    <name:Identifier> ":" <ty:TypeName> => {
+        let span = name.span.join(ty.name.span);
+        ast::Parameter { name, ty, span }
+    }
+};
+
+StateTransition: ast::StateTransition = {
+    <start:@L> "when" <from:Identifier> "->" <to:Identifier> <end:@R> => {
+        ast::StateTransition {
+            from,
+            to,
+            span: Span::new(start, end),
+        }
+    }
+};
+
+Field: ast::Field = {
+    <name:Identifier> ":" <ty:TypeName> <_terminator:Terminator?> => {
+        let span = name.span.join(ty.name.span);
+        ast::Field { name, ty, span }
+    }
+};
+
+Terminator: () = {
+    "," => (),
+    ";" => (),
+};
+
+TypeName: ast::TypeName = {
+    <name:Identifier> => ast::TypeName { name },
+    <name:PrimitiveType> => ast::TypeName { name },
+};
+
+PrimitiveType: ast::Identifier = {
+    <start:@L> "int" <end:@R> => ast::Identifier {
+        text: "int".to_owned(),
+        span: Span::new(start, end),
+    },
+    <start:@L> "uint" <end:@R> => ast::Identifier {
+        text: "uint".to_owned(),
+        span: Span::new(start, end),
+    },
+    <start:@L> "bool" <end:@R> => ast::Identifier {
+        text: "bool".to_owned(),
+        span: Span::new(start, end),
+    },
+    <start:@L> "string" <end:@R> => ast::Identifier {
+        text: "string".to_owned(),
+        span: Span::new(start, end),
+    },
+    <start:@L> "address" <end:@R> => ast::Identifier {
+        text: "address".to_owned(),
+        span: Span::new(start, end),
+    },
+    <start:@L> "hex" <end:@R> => ast::Identifier {
+        text: "hex".to_owned(),
+        span: Span::new(start, end),
+    },
+};
+
+MustBlock: ast::ConstraintBlock = {
+    <start:@L> "must" "[" <expressions:MustExpressions> "]" <end:@R> => {
+        ast::ConstraintBlock {
+            expressions,
+            span: Span::new(start, end),
+        }
+    }
+};
+
+MustExpressions: Vec<ast::Expression> = {
+    <expression:Expression> => vec![expression],
+    <mut expressions:MustExpressions> <_separator:MustSeparator> <expression:Expression> => {
+        expressions.push(expression);
+        expressions
+    },
+};
+
+MustSeparator: () = {
+    "," => (),
+    ";" => (),
+};
+
+Statement: ast::Statement = {
+    <start:@L> "skip" ";" <end:@R> => ast::Statement::Skip {
+        span: Span::new(start, end),
+    },
+};
+
+Expression: ast::Expression = {
+    <Comparison>
+};
+
+Comparison: ast::Expression = {
+    <lhs:Comparison> <op:ComparisonOperator> <rhs:Additive> => {
+        let span = lhs.span().join(rhs.span());
+        ast::Expression::Binary {
+            lhs: Box::new(lhs),
+            op,
+            rhs: Box::new(rhs),
+            span,
+        }
+    },
+    <Additive>
+};
+
+ComparisonOperator: ast::BinaryOperator = {
+    "==" => ast::BinaryOperator::Equal,
+    "!=" => ast::BinaryOperator::NotEqual,
+    ">" => ast::BinaryOperator::Greater,
+    ">=" => ast::BinaryOperator::GreaterEqual,
+    "<" => ast::BinaryOperator::Less,
+    "<=" => ast::BinaryOperator::LessEqual,
+};
+
+Additive: ast::Expression = {
+    <lhs:Additive> <op:AdditiveOperator> <rhs:Multiplicative> => {
+        let span = lhs.span().join(rhs.span());
+        ast::Expression::Binary {
+            lhs: Box::new(lhs),
+            op,
+            rhs: Box::new(rhs),
+            span,
+        }
+    },
+    <Multiplicative>
+};
+
+AdditiveOperator: ast::BinaryOperator = {
+    "+" => ast::BinaryOperator::Add,
+    "-" => ast::BinaryOperator::Subtract,
+};
+
+Multiplicative: ast::Expression = {
+    <lhs:Multiplicative> <op:MultiplicativeOperator> <rhs:Primary> => {
+        let span = lhs.span().join(rhs.span());
+        ast::Expression::Binary {
+            lhs: Box::new(lhs),
+            op,
+            rhs: Box::new(rhs),
+            span,
+        }
+    },
+    <Primary>
+};
+
+MultiplicativeOperator: ast::BinaryOperator = {
+    "*" => ast::BinaryOperator::Multiply,
+    "/" => ast::BinaryOperator::Divide,
+    "%" => ast::BinaryOperator::Modulo,
+};
+
+Primary: ast::Expression = {
+    <identifier:Identifier> => ast::Expression::Identifier(identifier),
+    <start:@L> <text:integer> <end:@R> => ast::Expression::Integer(ast::IntegerLiteral {
+        text,
+        span: Span::new(start, end),
+    }),
+    "(" <expression:Expression> ")" => expression,
+};
+
+Identifier: ast::Identifier = {
+    <start:@L> <text:ident> <end:@R> => ast::Identifier {
+        text,
+        span: Span::new(start, end),
+    }
+};
+
+CommaSeparated<T>: Vec<T> = {
+    <value:T> => vec![value],
+    <mut values:CommaSeparated<T>> "," <value:T> => {
+        values.push(value);
+        values
+    },
+};
+
+extern {
+    type Location = usize;
+    type Error = LexError;
+
+    enum Token {
+        ident => Token::Identifier(<String>),
+        integer => Token::Integer(<String>),
+        "model" => Token::Model,
+        "state" => Token::State,
+        "fn" => Token::Fn,
+        "when" => Token::When,
+        "must" => Token::Must,
+        "skip" => Token::Skip,
+        "int" => Token::Int,
+        "uint" => Token::UInt,
+        "bool" => Token::Bool,
+        "string" => Token::StringType,
+        "address" => Token::Address,
+        "hex" => Token::Hex,
+        "{" => Token::LeftBrace,
+        "}" => Token::RightBrace,
+        "(" => Token::LeftParen,
+        ")" => Token::RightParen,
+        "[" => Token::LeftBracket,
+        "]" => Token::RightBracket,
+        ":" => Token::Colon,
+        "," => Token::Comma,
+        ";" => Token::Semicolon,
+        "->" => Token::Arrow,
+        ">=" => Token::GreaterEqual,
+        "<=" => Token::LessEqual,
+        "==" => Token::EqualEqual,
+        "!=" => Token::BangEqual,
+        ">" => Token::Greater,
+        "<" => Token::Less,
+        "+" => Token::Plus,
+        "-" => Token::Minus,
+        "*" => Token::Star,
+        "/" => Token::Slash,
+        "%" => Token::Percent,
+    }
+}
