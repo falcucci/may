@@ -32,7 +32,7 @@ impl CheckCommand {
             Ok(definition) => {
                 println!(
                     "Program is semantically valid: {} declarations.",
-                    definition.declarations.len()
+                    definition.declaration_count()
                 );
             }
             Err(errors) => {
