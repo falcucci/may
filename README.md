@@ -19,7 +19,9 @@ start of the front end: parsing and basic semantic checks._
         must [ value >= 0 ]
     }
 
-    fn increment(amount: int) when Ready -> Ready {
+    fn increment(amount: int) when Ready -> Ready
+    must [ amount > 0 ]
+    {
         skip;
     }
 

@@ -9,6 +9,7 @@ use parser::ast::Expression;
 use parser::ast::Field;
 use parser::ast::Identifier;
 use parser::ast::ModelItem;
+use parser::ast::Parameter;
 use parser::ast::Source;
 use parser::ast::TypeName;
 
@@ -131,7 +132,7 @@ impl Checker {
                     continue;
                 };
 
-                self.check_duplicate_field(&model.name, field, &mut fields);
+                self.check_duplicate_field(&model.name, field, &fields);
                 self.check_type(&field.ty);
 
                 if !fields.contains_key(&field.name.text) {
@@ -142,7 +143,6 @@ impl Checker {
             self.model_fields.insert(model.name.text.clone(), fields);
         }
     }
-
     fn check_declarations(&mut self, source: &Source) {
         for declaration in &source.declarations {
             match declaration {
@@ -170,13 +170,20 @@ impl Checker {
                     }
                 }
                 Declaration::Function(function) => {
+                    let mut scope = HashMap::new();
+
                     for param in &function.params {
                         self.check_type(&param.ty);
+                        self.add_parameter_to_scope(&function.name, param, &mut scope);
                     }
 
                     if let Some(transition) = &function.transition {
                         self.check_state_reference(&function.name, &transition.from);
                         self.check_state_reference(&function.name, &transition.to);
+                    }
+
+                    for block in &function.constraints {
+                        self.check_must_block(&function.name, &scope, block);
                     }
                 }
             }
@@ -187,7 +194,7 @@ impl Checker {
         &mut self,
         model_name: &Identifier,
         field: &Field,
-        fields: &mut HashMap<String, SemanticType>,
+        fields: &HashMap<String, SemanticType>,
     ) {
         if fields.contains_key(&field.name.text) {
             self.errors.push(SemanticError::new(
@@ -256,6 +263,25 @@ impl Checker {
                 ty.name.span,
             )),
         }
+    }
+    fn add_parameter_to_scope(
+        &mut self,
+        function_name: &Identifier,
+        param: &Parameter,
+        scope: &mut HashMap<String, SemanticType>,
+    ) {
+        if scope.contains_key(&param.name.text) {
+            self.errors.push(SemanticError::new(
+                format!(
+                    "{} already has a parameter named {}",
+                    function_name.text, param.name.text
+                ),
+                param.name.span,
+            ));
+            return;
+        }
+
+        scope.insert(param.name.text.clone(), self.resolve_type(&param.ty));
     }
 
     fn check_must_block(
@@ -498,7 +524,9 @@ state Ready(Counter) {
     must [ value >= 0 ]
 }
 
-fn increment(amount: int) when Ready -> Ready {
+fn increment(amount: int) when Ready -> Ready
+must [ amount > 0 ]
+{
     skip;
 }
 "#,
@@ -599,7 +627,6 @@ state Wallet {}
 
         check(&source).expect("source should be semantically valid");
     }
-
     #[test]
     fn rejects_unknown_model_must_identifiers() {
         let errors = semantic_errors(
@@ -686,5 +713,56 @@ model Counter {
         );
 
         assert!(errors.iter().any(|error| error == "operator + expects numeric operands"));
+    }
+
+    #[test]
+    fn checks_function_must_expressions_against_parameters() {
+        let errors = semantic_errors(
+            r#"
+fn increment(amount: int) must [ missing > 0 ] {
+    skip;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment must block refers to unknown identifier missing")
+        );
+    }
+
+    #[test]
+    fn rejects_non_boolean_function_must_expressions() {
+        let errors = semantic_errors(
+            r#"
+fn increment(amount: int) must [ amount ] {
+    skip;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment must expression must resolve to bool")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_function_parameters() {
+        let errors = semantic_errors(
+            r#"
+fn increment(amount: int, amount: int) must [ amount > 0 ] {
+    skip;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment already has a parameter named amount")
+        );
     }
 }
