@@ -46,11 +46,12 @@ StateModel: ast::Identifier = {
 
 FunctionDeclaration: ast::FunctionDeclaration = {
     <start:@L> "fn" <name:Identifier> "(" <params:Parameters> ")"
-    <transition:StateTransition?> "{" <body:Statement*> "}" <end:@R> => {
+    <transition:StateTransition?> <constraints:MustBlock*> "{" <body:Statement*> "}" <end:@R> => {
         ast::FunctionDeclaration {
             name,
             params,
             transition,
+            constraints,
             body,
             span: Span::new(start, end),
         }

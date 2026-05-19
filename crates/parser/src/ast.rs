@@ -38,6 +38,7 @@ pub struct FunctionDeclaration {
     pub name: Identifier,
     pub params: Vec<Parameter>,
     pub transition: Option<StateTransition>,
+    pub constraints: Vec<ConstraintBlock>,
     pub body: Vec<Statement>,
     pub span: Span,
 }

@@ -99,7 +99,9 @@ state Ready(Counter) {
     ]
 }
 
-fn increment(amount: int) when Ready -> Ready {
+fn increment(amount: int) when Ready -> Ready
+must [ amount > 0 ]
+{
     skip;
 }
 "#;
@@ -142,6 +144,7 @@ fn increment(amount: int) when Ready -> Ready {
             function.transition.as_ref().map(|transition| transition.to.text.as_str()),
             Some("Ready")
         );
+        assert_eq!(function.constraints.len(), 1);
         assert!(matches!(function.body.as_slice(), [Statement::Skip { .. }]));
     }
 
