@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::fmt;
 
 use parser::Span;
+use parser::ast::BinaryOperator;
+use parser::ast::ConstraintBlock;
 use parser::ast::Declaration;
+use parser::ast::Expression;
 use parser::ast::Field;
 use parser::ast::Identifier;
 use parser::ast::ModelItem;
@@ -68,6 +71,7 @@ impl std::error::Error for SemanticError {}
 pub fn check(source: &Source) -> Result<ContractDefinition, Vec<SemanticError>> {
     let mut checker = Checker::default();
     checker.collect_declarations(source);
+    checker.collect_model_fields(source);
     checker.check_declarations(source);
 
     if checker.errors.is_empty() {
@@ -88,6 +92,7 @@ pub fn check(source: &Source) -> Result<ContractDefinition, Vec<SemanticError>> 
 struct Checker {
     symbols: HashMap<String, DeclarationInfo>,
     declaration_order: Vec<String>,
+    model_fields: HashMap<String, HashMap<String, SemanticType>>,
     errors: Vec<SemanticError>,
 }
 
@@ -109,13 +114,59 @@ impl Checker {
         }
     }
 
+    fn collect_model_fields(&mut self, source: &Source) {
+        for declaration in &source.declarations {
+            let Declaration::Model(model) = declaration else {
+                continue;
+            };
+
+            if self.model_fields.contains_key(&model.name.text) {
+                continue;
+            }
+
+            let mut fields = HashMap::<String, SemanticType>::new();
+
+            for item in &model.items {
+                let ModelItem::Field(field) = item else {
+                    continue;
+                };
+
+                self.check_duplicate_field(&model.name, field, &mut fields);
+                self.check_type(&field.ty);
+
+                if !fields.contains_key(&field.name.text) {
+                    fields.insert(field.name.text.clone(), self.resolve_type(&field.ty));
+                }
+            }
+
+            self.model_fields.insert(model.name.text.clone(), fields);
+        }
+    }
+
     fn check_declarations(&mut self, source: &Source) {
         for declaration in &source.declarations {
             match declaration {
-                Declaration::Model(model) => self.check_model_fields(&model.name, &model.items),
+                Declaration::Model(model) => {
+                    if let Some(scope) = self.model_fields.get(&model.name.text).cloned() {
+                        for item in &model.items {
+                            if let ModelItem::Constraint(block) = item {
+                                self.check_must_block(&model.name, &scope, block);
+                            }
+                        }
+                    }
+                }
                 Declaration::State(state) => {
+                    let mut scope = HashMap::new();
+
                     if let Some(model) = &state.model {
                         self.check_model_reference(&state.name, model);
+                        if let Some(model_fields) = self.model_fields.get(&model.text) {
+                            scope = model_fields.clone();
+                        }
+                    }
+
+                    for block in &state.constraints {
+                        self.check_must_block(&state.name, &scope, block);
                     }
                 }
                 Declaration::Function(function) => {
@@ -132,26 +183,13 @@ impl Checker {
         }
     }
 
-    fn check_model_fields(&mut self, model_name: &Identifier, items: &[ModelItem]) {
-        let mut fields = HashMap::<String, Span>::new();
-
-        for item in items {
-            let ModelItem::Field(field) = item else {
-                continue;
-            };
-
-            self.check_duplicate_field(model_name, field, &mut fields);
-            self.check_type(&field.ty);
-        }
-    }
-
     fn check_duplicate_field(
         &mut self,
         model_name: &Identifier,
         field: &Field,
-        fields: &mut HashMap<String, Span>,
+        fields: &mut HashMap<String, SemanticType>,
     ) {
-        if fields.insert(field.name.text.clone(), field.name.span).is_some() {
+        if fields.contains_key(&field.name.text) {
             self.errors.push(SemanticError::new(
                 format!(
                     "{} already has a field named {}",
@@ -219,6 +257,141 @@ impl Checker {
             )),
         }
     }
+
+    fn check_must_block(
+        &mut self,
+        owner_name: &Identifier,
+        scope: &HashMap<String, SemanticType>,
+        block: &ConstraintBlock,
+    ) {
+        for expression in &block.expressions {
+            let ty = self.infer_expression(owner_name, scope, expression);
+
+            if ty == SemanticType::Unknown {
+                continue;
+            }
+
+            if ty != SemanticType::Bool {
+                self.errors.push(SemanticError::new(
+                    format!("{} must expression must resolve to bool", owner_name.text),
+                    expression.span(),
+                ));
+            }
+        }
+    }
+
+    fn infer_expression(
+        &mut self,
+        owner_name: &Identifier,
+        scope: &HashMap<String, SemanticType>,
+        expression: &Expression,
+    ) -> SemanticType {
+        match expression {
+            Expression::Identifier(identifier) => match scope.get(&identifier.text) {
+                Some(ty) => ty.clone(),
+                None => {
+                    self.errors.push(SemanticError::new(
+                        format!(
+                            "{} must block refers to unknown identifier {}",
+                            owner_name.text, identifier.text
+                        ),
+                        identifier.span,
+                    ));
+                    SemanticType::Unknown
+                }
+            },
+            Expression::Integer(_) => SemanticType::IntegerLiteral,
+            Expression::Binary { lhs, op, rhs, span } => {
+                let lhs_ty = self.infer_expression(owner_name, scope, lhs);
+                let rhs_ty = self.infer_expression(owner_name, scope, rhs);
+
+                if lhs_ty == SemanticType::Unknown || rhs_ty == SemanticType::Unknown {
+                    return SemanticType::Unknown;
+                }
+
+                self.infer_binary_expression(*op, &lhs_ty, &rhs_ty, *span)
+            }
+        }
+    }
+
+    fn infer_binary_expression(
+        &mut self,
+        op: BinaryOperator,
+        lhs_ty: &SemanticType,
+        rhs_ty: &SemanticType,
+        span: Span,
+    ) -> SemanticType {
+        match op {
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo => {
+                if lhs_ty.is_numeric() && rhs_ty.is_numeric() {
+                    SemanticType::merged_numeric(lhs_ty, rhs_ty)
+                } else {
+                    self.errors.push(SemanticError::new(
+                        format!(
+                            "operator {} expects numeric operands",
+                            binary_operator_text(op)
+                        ),
+                        span,
+                    ));
+                    SemanticType::Unknown
+                }
+            }
+            BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual
+            | BinaryOperator::Less
+            | BinaryOperator::LessEqual => {
+                if lhs_ty.is_numeric() && rhs_ty.is_numeric() {
+                    SemanticType::Bool
+                } else {
+                    self.errors.push(SemanticError::new(
+                        format!(
+                            "operator {} expects numeric operands",
+                            binary_operator_text(op)
+                        ),
+                        span,
+                    ));
+                    SemanticType::Unknown
+                }
+            }
+            BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                if lhs_ty.is_compatible_with(rhs_ty) {
+                    SemanticType::Bool
+                } else {
+                    self.errors.push(SemanticError::new(
+                        format!(
+                            "operator {} expects compatible operands",
+                            binary_operator_text(op)
+                        ),
+                        span,
+                    ));
+                    SemanticType::Unknown
+                }
+            }
+        }
+    }
+
+    fn resolve_type(&self, ty: &TypeName) -> SemanticType {
+        match ty.name.text.as_str() {
+            "int" => SemanticType::Int,
+            "uint" => SemanticType::UInt,
+            "bool" => SemanticType::Bool,
+            "string" => SemanticType::String,
+            "address" => SemanticType::Address,
+            "hex" => SemanticType::Hex,
+            name => match self.symbols.get(name) {
+                Some(info)
+                    if matches!(info.kind, DeclarationKind::Model | DeclarationKind::State) =>
+                {
+                    SemanticType::Custom(name.to_owned())
+                }
+                _ => SemanticType::Unknown,
+            },
+        }
+    }
 }
 
 fn declaration_info(declaration: &Declaration) -> DeclarationInfo {
@@ -243,6 +416,58 @@ fn declaration_info(declaration: &Declaration) -> DeclarationInfo {
 
 fn is_primitive_type(name: &str) -> bool {
     matches!(name, "int" | "uint" | "bool" | "string" | "address" | "hex")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SemanticType {
+    Int,
+    UInt,
+    Bool,
+    String,
+    Address,
+    Hex,
+    Custom(String),
+    IntegerLiteral,
+    Unknown,
+}
+
+impl SemanticType {
+    fn is_numeric(&self) -> bool {
+        matches!(
+            self,
+            SemanticType::Int | SemanticType::UInt | SemanticType::IntegerLiteral
+        )
+    }
+
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        self == other || (self.is_numeric() && other.is_numeric())
+    }
+
+    fn merged_numeric(lhs: &Self, rhs: &Self) -> Self {
+        if lhs == &SemanticType::Int || rhs == &SemanticType::Int {
+            SemanticType::Int
+        } else if lhs == &SemanticType::UInt || rhs == &SemanticType::UInt {
+            SemanticType::UInt
+        } else {
+            SemanticType::IntegerLiteral
+        }
+    }
+}
+
+fn binary_operator_text(op: BinaryOperator) -> &'static str {
+    match op {
+        BinaryOperator::Equal => "==",
+        BinaryOperator::NotEqual => "!=",
+        BinaryOperator::Greater => ">",
+        BinaryOperator::GreaterEqual => ">=",
+        BinaryOperator::Less => "<",
+        BinaryOperator::LessEqual => "<=",
+        BinaryOperator::Add => "+",
+        BinaryOperator::Subtract => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::Divide => "/",
+        BinaryOperator::Modulo => "%",
+    }
 }
 
 #[cfg(test)]
@@ -373,5 +598,93 @@ state Wallet {}
         .expect("source should parse");
 
         check(&source).expect("source should be semantically valid");
+    }
+
+    #[test]
+    fn rejects_unknown_model_must_identifiers() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+    must [ missing >= 0 ]
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "Counter must block refers to unknown identifier missing")
+        );
+    }
+
+    #[test]
+    fn rejects_non_boolean_model_must_expressions() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+    must [ value ]
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "Counter must expression must resolve to bool")
+        );
+    }
+
+    #[test]
+    fn checks_state_must_expressions_against_model_fields() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {
+    must [ missing >= 0 ]
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "Ready must block refers to unknown identifier missing")
+        );
+    }
+
+    #[test]
+    fn rejects_state_must_fields_without_a_model_scope() {
+        let errors = semantic_errors(
+            r#"
+state Ready {
+    must [ value >= 0 ]
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "Ready must block refers to unknown identifier value")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_must_operator_operands() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: string
+    must [ value + 1 >= 0 ]
+}
+"#,
+        );
+
+        assert!(errors.iter().any(|error| error == "operator + expects numeric operands"));
     }
 }
