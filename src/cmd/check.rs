@@ -20,17 +20,27 @@ impl CheckCommand {
             }
         };
 
-        match parser::parse_source(&source) {
-            Ok(program) => {
-                println!(
-                    "Program parsed successfully: {} declarations.",
-                    program.declarations.len()
-                );
-            }
+        let program = match parser::parse_source(&source) {
+            Ok(program) => program,
             Err(error) => {
                 eprintln!("parse error: {error}");
                 process::exit(1);
             }
-        }
+        };
+
+        match semantics::check(&program) {
+            Ok(definition) => {
+                println!(
+                    "Program is semantically valid: {} declarations.",
+                    definition.declarations.len()
+                );
+            }
+            Err(errors) => {
+                for error in errors {
+                    eprintln!("semantic error: {error}");
+                }
+                process::exit(1);
+            }
+        };
     }
 }

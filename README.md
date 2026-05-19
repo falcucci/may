@@ -8,7 +8,7 @@ models, states, transitions, and invariants should be written in syntax the
 compiler can parse, check and eventually verify.
 
 _This is not a usable contract language yet. Right now the project only has the
-start of the front end._
+start of the front end: parsing and basic semantic checks._
 
     model Counter {
         value: int
@@ -23,6 +23,6 @@ start of the front end._
         skip;
     }
 
-Run the parser:
+Run the checks:
 
     cargo run -- check examples/counter.may

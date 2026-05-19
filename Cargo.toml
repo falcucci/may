@@ -7,8 +7,10 @@ edition = "2024"
 members = [
   ".",
   "crates/parser",
+  "crates/semantics",
 ]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 parser = { path = "crates/parser" }
+semantics = { path = "crates/semantics" }
