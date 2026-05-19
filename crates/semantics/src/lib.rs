@@ -15,7 +15,80 @@ use parser::ast::TypeName;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractDefinition {
-    pub declarations: Vec<DeclarationInfo>,
+    pub models: Vec<ModelDefinition>,
+    pub states: Vec<StateDefinition>,
+    pub functions: Vec<FunctionDefinition>,
+}
+
+impl ContractDefinition {
+    pub fn declaration_count(&self) -> usize {
+        self.models.len() + self.states.len() + self.functions.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDefinition {
+    pub name: String,
+    pub fields: Vec<FieldDefinition>,
+    pub bounds: Bounds,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateDefinition {
+    pub name: String,
+    pub model: Option<String>,
+    pub fields: Vec<FieldDefinition>,
+    pub bounds: Bounds,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub params: Vec<ParameterDefinition>,
+    pub transition: Option<StateTransitionDefinition>,
+    pub bounds: Bounds,
+    pub body: Vec<parser::ast::Statement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDefinition {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterDefinition {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTransitionDefinition {
+    pub from: String,
+    pub to: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bounds {
+    pub span: Span,
+    pub expressions: Vec<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Type {
+    Int,
+    UInt,
+    Bool,
+    String,
+    Address,
+    Hex,
+    Custom(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,14 +149,7 @@ pub fn check(source: &Source) -> Result<ContractDefinition, Vec<SemanticError>> 
     checker.check_declarations(source);
 
     if checker.errors.is_empty() {
-        Ok(ContractDefinition {
-            declarations: checker
-                .declaration_order
-                .iter()
-                .filter_map(|name| checker.symbols.get(name))
-                .cloned()
-                .collect(),
-        })
+        Ok(checker.build_contract(source))
     } else {
         Err(checker.errors)
     }
@@ -92,7 +158,6 @@ pub fn check(source: &Source) -> Result<ContractDefinition, Vec<SemanticError>> 
 #[derive(Default)]
 struct Checker {
     symbols: HashMap<String, DeclarationInfo>,
-    declaration_order: Vec<String>,
     model_fields: HashMap<String, HashMap<String, SemanticType>>,
     errors: Vec<SemanticError>,
 }
@@ -110,7 +175,6 @@ impl Checker {
                 continue;
             }
 
-            self.declaration_order.push(info.name.clone());
             self.symbols.insert(info.name.clone(), info);
         }
     }
@@ -188,6 +252,97 @@ impl Checker {
                 }
             }
         }
+    }
+
+    fn build_contract(&self, source: &Source) -> ContractDefinition {
+        let mut contract = ContractDefinition {
+            models: Vec::new(),
+            states: Vec::new(),
+            functions: Vec::new(),
+        };
+
+        for declaration in &source.declarations {
+            match declaration {
+                Declaration::Model(model) => contract.models.push(ModelDefinition {
+                    name: model.name.text.clone(),
+                    fields: self.model_field_definitions(model),
+                    bounds: bounds_from_blocks(
+                        model.span,
+                        model.items.iter().filter_map(|item| match item {
+                            ModelItem::Constraint(block) => Some(block),
+                            ModelItem::Field(_) => None,
+                        }),
+                    ),
+                    span: model.span,
+                }),
+                Declaration::State(state) => contract.states.push(StateDefinition {
+                    name: state.name.text.clone(),
+                    model: state.model.as_ref().map(|model| model.text.clone()),
+                    fields: state
+                        .model
+                        .as_ref()
+                        .map(|model| self.model_fields_for_state(source, &model.text))
+                        .unwrap_or_default(),
+                    bounds: bounds_from_blocks(state.span, state.constraints.iter()),
+                    span: state.span,
+                }),
+                Declaration::Function(function) => contract.functions.push(FunctionDefinition {
+                    name: function.name.text.clone(),
+                    params: function
+                        .params
+                        .iter()
+                        .map(|param| ParameterDefinition {
+                            name: param.name.text.clone(),
+                            ty: self.type_definition(&param.ty),
+                            span: param.span,
+                        })
+                        .collect(),
+                    transition: function.transition.as_ref().map(|transition| {
+                        StateTransitionDefinition {
+                            from: transition.from.text.clone(),
+                            to: transition.to.text.clone(),
+                            span: transition.span,
+                        }
+                    }),
+                    bounds: bounds_from_blocks(function.span, function.constraints.iter()),
+                    body: function.body.clone(),
+                    span: function.span,
+                }),
+            }
+        }
+
+        contract
+    }
+
+    fn model_fields_for_state(&self, source: &Source, model_name: &str) -> Vec<FieldDefinition> {
+        source
+            .declarations
+            .iter()
+            .find_map(|declaration| match declaration {
+                Declaration::Model(model) if model.name.text == model_name => {
+                    Some(self.model_field_definitions(model))
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn model_field_definitions(
+        &self,
+        model: &parser::ast::ModelDeclaration,
+    ) -> Vec<FieldDefinition> {
+        model
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::Field(field) => Some(FieldDefinition {
+                    name: field.name.text.clone(),
+                    ty: self.type_definition(&field.ty),
+                    span: field.span,
+                }),
+                ModelItem::Constraint(_) => None,
+            })
+            .collect()
     }
 
     fn check_duplicate_field(
@@ -418,6 +573,12 @@ impl Checker {
             },
         }
     }
+
+    fn type_definition(&self, ty: &TypeName) -> Type {
+        self.resolve_type(ty)
+            .to_type()
+            .unwrap_or_else(|| Type::Custom(ty.name.text.clone()))
+    }
 }
 
 fn declaration_info(declaration: &Declaration) -> DeclarationInfo {
@@ -444,6 +605,19 @@ fn is_primitive_type(name: &str) -> bool {
     matches!(name, "int" | "uint" | "bool" | "string" | "address" | "hex")
 }
 
+fn bounds_from_blocks<'a>(
+    owner_span: Span,
+    blocks: impl IntoIterator<Item = &'a ConstraintBlock>,
+) -> Bounds {
+    Bounds {
+        span: owner_span,
+        expressions: blocks
+            .into_iter()
+            .flat_map(|block| block.expressions.iter().cloned())
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SemanticType {
     Int,
@@ -458,6 +632,19 @@ enum SemanticType {
 }
 
 impl SemanticType {
+    fn to_type(&self) -> Option<Type> {
+        match self {
+            SemanticType::Int => Some(Type::Int),
+            SemanticType::UInt => Some(Type::UInt),
+            SemanticType::Bool => Some(Type::Bool),
+            SemanticType::String => Some(Type::String),
+            SemanticType::Address => Some(Type::Address),
+            SemanticType::Hex => Some(Type::Hex),
+            SemanticType::Custom(name) => Some(Type::Custom(name.clone())),
+            SemanticType::IntegerLiteral | SemanticType::Unknown => None,
+        }
+    }
+
     fn is_numeric(&self) -> bool {
         matches!(
             self,
@@ -500,6 +687,7 @@ fn binary_operator_text(op: BinaryOperator) -> &'static str {
 mod tests {
     use parser::parse_source;
 
+    use super::Type;
     use super::check;
 
     fn semantic_errors(source: &str) -> Vec<String> {
@@ -534,7 +722,40 @@ must [ amount > 0 ]
         .expect("source should parse");
 
         let definition = check(&source).expect("source should be semantically valid");
-        assert_eq!(definition.declarations.len(), 3);
+        assert_eq!(definition.declaration_count(), 3);
+        assert_eq!(definition.models.len(), 1);
+        assert_eq!(definition.states.len(), 1);
+        assert_eq!(definition.functions.len(), 1);
+
+        let counter = &definition.models[0];
+        assert_eq!(counter.name, "Counter");
+        assert_eq!(counter.fields.len(), 1);
+        assert_eq!(counter.fields[0].name, "value");
+        assert_eq!(counter.fields[0].ty, Type::Int);
+        assert_eq!(counter.bounds.expressions.len(), 1);
+
+        let ready = &definition.states[0];
+        assert_eq!(ready.name, "Ready");
+        assert_eq!(ready.model.as_deref(), Some("Counter"));
+        assert_eq!(ready.fields.len(), 1);
+        assert_eq!(ready.fields[0].name, "value");
+        assert_eq!(ready.bounds.expressions.len(), 1);
+
+        let increment = &definition.functions[0];
+        assert_eq!(increment.name, "increment");
+        assert_eq!(increment.params.len(), 1);
+        assert_eq!(increment.params[0].name, "amount");
+        assert_eq!(increment.params[0].ty, Type::Int);
+        assert_eq!(
+            increment.transition.as_ref().map(|transition| transition.from.as_str()),
+            Some("Ready")
+        );
+        assert_eq!(
+            increment.transition.as_ref().map(|transition| transition.to.as_str()),
+            Some("Ready")
+        );
+        assert_eq!(increment.bounds.expressions.len(), 1);
+        assert_eq!(increment.body.len(), 1);
     }
 
     #[test]
