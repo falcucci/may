@@ -1,0 +1,13 @@
+model Counter {
+    value: int
+
+    must [ value >= 0 ]
+}
+
+state Ready(Counter) {
+    must [ value >= 0 ]
+}
+
+fn increment(amount: int) when Ready -> Ready {
+    skip;
+}
