@@ -516,7 +516,25 @@ fn z3_int(expression: &VerifiedExpression) -> Option<Int> {
         VerifiedExpression::Identifier { name, ty, .. } if ty.is_numeric() => {
             Some(Int::new_const(name.as_str()))
         }
-        VerifiedExpression::Binary { .. } | VerifiedExpression::Identifier { .. } => None,
+        VerifiedExpression::Binary { lhs, op, rhs, .. } => {
+            let lhs = z3_int(lhs)?;
+            let rhs = z3_int(rhs)?;
+
+            match op {
+                VerifiedBinaryOperator::Add => Some(Int::add(&[&lhs, &rhs])),
+                VerifiedBinaryOperator::Subtract => Some(Int::sub(&[&lhs, &rhs])),
+                VerifiedBinaryOperator::Multiply => Some(Int::mul(&[&lhs, &rhs])),
+                VerifiedBinaryOperator::Divide => Some(lhs.div(&rhs)),
+                VerifiedBinaryOperator::Modulo => Some(lhs.modulo(&rhs)),
+                VerifiedBinaryOperator::Equal
+                | VerifiedBinaryOperator::NotEqual
+                | VerifiedBinaryOperator::Greater
+                | VerifiedBinaryOperator::GreaterEqual
+                | VerifiedBinaryOperator::Less
+                | VerifiedBinaryOperator::LessEqual => None,
+            }
+        }
+        VerifiedExpression::Identifier { .. } => None,
     }
 }
 
@@ -679,12 +697,38 @@ model Broken {
     }
 
     #[test]
-    fn z3_backend_reports_unsupported_arithmetic_constraints() {
+    fn z3_backend_accepts_integer_arithmetic_constraints() {
         let source = parser::parse_source(
             r#"
 model Counter {
     value: int
-    must [ value + 1 > 0 ]
+    must [
+        value + 1 > 0,
+        value - 1 < 10,
+        value * 2 >= 0,
+        value / 2 == 3,
+        value % 2 == 0
+    ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 5);
+        assert_eq!(report.accepted_constraints(), 5);
+        assert_eq!(report.rejected_constraints(), 0);
+        assert_eq!(report.unsupported_constraints(), 0);
+    }
+
+    #[test]
+    fn z3_backend_rejects_unsatisfiable_arithmetic_constraints() {
+        let source = parser::parse_source(
+            r#"
+model Broken {
+    must [ 1 + 1 == 3 ]
 }
 "#,
         )
@@ -695,11 +739,8 @@ model Counter {
 
         assert_eq!(report.checked_bounds, 1);
         assert_eq!(report.accepted_constraints(), 0);
-        assert_eq!(report.unsupported_constraints(), 1);
-        assert!(matches!(
-            &report.solver_results[0].result,
-            SolverResult::Unsupported(_)
-        ));
+        assert_eq!(report.rejected_constraints(), 1);
+        assert_eq!(report.unsupported_constraints(), 0);
     }
 
     #[test]
