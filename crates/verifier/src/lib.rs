@@ -10,6 +10,10 @@ use semantics::FunctionDefinition;
 use semantics::ParameterDefinition;
 use semantics::StateDefinition;
 use semantics::Type;
+use z3::SatResult;
+use z3::Solver;
+use z3::ast::Bool;
+use z3::ast::Int;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
@@ -18,6 +22,37 @@ pub struct VerificationReport {
     pub state_bounds: usize,
     pub function_bounds: usize,
     pub constraints: Vec<Constraint>,
+    pub solver_results: Vec<ConstraintSolverResult>,
+}
+
+impl VerificationReport {
+    pub fn accepted_constraints(&self) -> usize {
+        self.solver_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Accepted)
+            .count()
+    }
+
+    pub fn rejected_constraints(&self) -> usize {
+        self.solver_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Rejected)
+            .count()
+    }
+
+    pub fn unknown_constraints(&self) -> usize {
+        self.solver_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Unknown)
+            .count()
+    }
+
+    pub fn unsupported_constraints(&self) -> usize {
+        self.solver_results
+            .iter()
+            .filter(|result| matches!(result.result, SolverResult::Unsupported(_)))
+            .count()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +60,21 @@ pub struct Constraint {
     pub owner: BoundOwner,
     pub expression: VerifiedExpression,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintSolverResult {
+    pub owner: BoundOwner,
+    pub span: Span,
+    pub result: SolverResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SolverResult {
+    Accepted,
+    Rejected,
+    Unknown,
+    Unsupported(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +232,47 @@ impl fmt::Display for VerificationError {
 
 impl std::error::Error for VerificationError {}
 
+pub trait SolverBackend {
+    fn check_constraint(&self, constraint: &Constraint) -> SolverResult;
+}
+
+#[derive(Debug, Default)]
+pub struct StructuralBackend;
+
+impl SolverBackend for StructuralBackend {
+    fn check_constraint(&self, _constraint: &Constraint) -> SolverResult { SolverResult::Accepted }
+}
+
+#[derive(Debug, Default)]
+pub struct Z3Backend;
+
+impl SolverBackend for Z3Backend {
+    fn check_constraint(&self, constraint: &Constraint) -> SolverResult {
+        let Some(expression) = z3_bool(&constraint.expression) else {
+            return SolverResult::Unsupported(
+                "constraint is not supported by the Z3 backend yet".to_owned(),
+            );
+        };
+
+        let solver = Solver::new();
+        solver.assert(&expression);
+
+        match solver.check() {
+            SatResult::Sat => SolverResult::Accepted,
+            SatResult::Unsat => SolverResult::Rejected,
+            SatResult::Unknown => SolverResult::Unknown,
+        }
+    }
+}
+
 pub fn verify(contract: &ContractDefinition) -> Result<VerificationReport, Vec<VerificationError>> {
+    verify_with_backend(contract, &Z3Backend)
+}
+
+pub fn verify_with_backend(
+    contract: &ContractDefinition,
+    backend: &impl SolverBackend,
+) -> Result<VerificationReport, Vec<VerificationError>> {
     let mut verifier = Verifier::default();
 
     for model in &contract.models {
@@ -199,7 +289,18 @@ pub fn verify(contract: &ContractDefinition) -> Result<VerificationReport, Vec<V
     }
 
     if verifier.errors.is_empty() {
-        Ok(verifier.report)
+        let mut report = verifier.report;
+        report.solver_results = report
+            .constraints
+            .iter()
+            .map(|constraint| ConstraintSolverResult {
+                owner: constraint.owner.clone(),
+                span: constraint.span,
+                result: backend.check_constraint(constraint),
+            })
+            .collect();
+
+        Ok(report)
     } else {
         Err(verifier.errors)
     }
@@ -385,6 +486,40 @@ impl Verifier {
     }
 }
 
+fn z3_bool(expression: &VerifiedExpression) -> Option<Bool> {
+    match expression {
+        VerifiedExpression::Binary { lhs, op, rhs, .. } => match op {
+            VerifiedBinaryOperator::Equal => Some(z3_int(lhs)?.eq(&z3_int(rhs)?)),
+            VerifiedBinaryOperator::NotEqual => Some(z3_int(lhs)?.eq(&z3_int(rhs)?).not()),
+            VerifiedBinaryOperator::Greater => Some(z3_int(lhs)?.gt(&z3_int(rhs)?)),
+            VerifiedBinaryOperator::GreaterEqual => Some(z3_int(lhs)?.ge(&z3_int(rhs)?)),
+            VerifiedBinaryOperator::Less => Some(z3_int(lhs)?.lt(&z3_int(rhs)?)),
+            VerifiedBinaryOperator::LessEqual => Some(z3_int(lhs)?.le(&z3_int(rhs)?)),
+            VerifiedBinaryOperator::Add
+            | VerifiedBinaryOperator::Subtract
+            | VerifiedBinaryOperator::Multiply
+            | VerifiedBinaryOperator::Divide
+            | VerifiedBinaryOperator::Modulo => None,
+        },
+        VerifiedExpression::Identifier {
+            name,
+            ty: VerifiedType::Bool,
+            ..
+        } => Some(Bool::new_const(name.as_str())),
+        VerifiedExpression::IntLiteral { .. } | VerifiedExpression::Identifier { .. } => None,
+    }
+}
+
+fn z3_int(expression: &VerifiedExpression) -> Option<Int> {
+    match expression {
+        VerifiedExpression::IntLiteral { text, .. } => text.parse::<i64>().ok().map(Int::from_i64),
+        VerifiedExpression::Identifier { name, ty, .. } if ty.is_numeric() => {
+            Some(Int::new_const(name.as_str()))
+        }
+        VerifiedExpression::Binary { .. } | VerifiedExpression::Identifier { .. } => None,
+    }
+}
+
 fn scope_from_fields(fields: &[FieldDefinition]) -> HashMap<String, VerifiedType> {
     fields
         .iter()
@@ -425,6 +560,7 @@ impl Default for VerificationReport {
             state_bounds: 0,
             function_bounds: 0,
             constraints: Vec::new(),
+            solver_results: Vec::new(),
         }
     }
 }
@@ -440,10 +576,13 @@ mod tests {
     use semantics::ModelDefinition;
 
     use super::BoundOwner;
+    use super::SolverResult;
+    use super::StructuralBackend;
     use super::VerifiedBinaryOperator;
     use super::VerifiedExpression;
     use super::VerifiedType;
     use super::verify;
+    use super::verify_with_backend;
 
     #[test]
     fn lowers_model_state_and_function_bounds() {
@@ -474,6 +613,10 @@ must [ amount > 0 ]
         assert_eq!(report.model_bounds, 1);
         assert_eq!(report.state_bounds, 1);
         assert_eq!(report.function_bounds, 1);
+        assert_eq!(report.accepted_constraints(), 3);
+        assert_eq!(report.rejected_constraints(), 0);
+        assert_eq!(report.unknown_constraints(), 0);
+        assert_eq!(report.unsupported_constraints(), 0);
         assert_has_identifier_constraint(
             &report,
             BoundOwner::Model("Counter".to_owned()),
@@ -492,6 +635,71 @@ must [ amount > 0 ]
             "amount",
             VerifiedType::Int,
         );
+    }
+
+    #[test]
+    fn structural_backend_accepts_lowered_constraints() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+    must [ value >= 0 ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify_with_backend(&contract, &StructuralBackend)
+            .expect("contract should verify structurally");
+
+        assert_eq!(report.checked_bounds, 1);
+        assert_eq!(report.solver_results.len(), 1);
+        assert_eq!(report.solver_results[0].result, SolverResult::Accepted);
+    }
+
+    #[test]
+    fn z3_backend_rejects_unsatisfiable_integer_constraints() {
+        let source = parser::parse_source(
+            r#"
+model Broken {
+    must [ 0 > 1 ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 1);
+        assert_eq!(report.accepted_constraints(), 0);
+        assert_eq!(report.rejected_constraints(), 1);
+        assert_eq!(report.solver_results[0].result, SolverResult::Rejected);
+    }
+
+    #[test]
+    fn z3_backend_reports_unsupported_arithmetic_constraints() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+    must [ value + 1 > 0 ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 1);
+        assert_eq!(report.accepted_constraints(), 0);
+        assert_eq!(report.unsupported_constraints(), 1);
+        assert!(matches!(
+            &report.solver_results[0].result,
+            SolverResult::Unsupported(_)
+        ));
     }
 
     #[test]
