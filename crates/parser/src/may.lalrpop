@@ -71,13 +71,23 @@ Parameter: ast::Parameter = {
 };
 
 StateTransition: ast::StateTransition = {
-    <start:@L> "when" <from:Identifier> "->" <to:Identifier> <end:@R> => {
+    <start:@L> "when" <from:StateTransitionEndpoint> "->" <to:StateTransitionEndpoint> <end:@R> => {
         ast::StateTransition {
-            from,
-            to,
+            from: from.0,
+            from_alias: from.1,
+            to: to.0,
+            to_alias: to.1,
             span: Span::new(start, end),
         }
     }
+};
+
+StateTransitionEndpoint: (ast::Identifier, Option<ast::Identifier>) = {
+    <state:Identifier> <alias:StateTransitionAlias?> => (state, alias),
+};
+
+StateTransitionAlias: ast::Identifier = {
+    "as" <alias:Identifier> => alias,
 };
 
 Field: ast::Field = {
@@ -216,6 +226,14 @@ MultiplicativeOperator: ast::BinaryOperator = {
 };
 
 Primary: ast::Expression = {
+    <base:Identifier> "." <field:Identifier> => {
+        let span = base.span.join(field.span);
+        ast::Expression::FieldAccess {
+            base,
+            field,
+            span,
+        }
+    },
     <identifier:Identifier> => ast::Expression::Identifier(identifier),
     <start:@L> <text:integer> <end:@R> => ast::Expression::Integer(ast::IntegerLiteral {
         text,
@@ -250,6 +268,7 @@ extern {
         "state" => Token::State,
         "fn" => Token::Fn,
         "when" => Token::When,
+        "as" => Token::As,
         "must" => Token::Must,
         "skip" => Token::Skip,
         "int" => Token::Int,
@@ -267,6 +286,7 @@ extern {
         ":" => Token::Colon,
         "," => Token::Comma,
         ";" => Token::Semicolon,
+        "." => Token::Dot,
         "->" => Token::Arrow,
         ">=" => Token::GreaterEqual,
         "<=" => Token::LessEqual,

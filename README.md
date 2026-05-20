@@ -7,8 +7,8 @@ The goal is simple: make the important rules part of the language itself. Data
 models, states, transitions, and invariants should be written in syntax the
 compiler can parse, check and eventually verify.
 
-_This is not a usable contract language yet. Right now the project only has the
-start of the front end: parsing and basic semantic checks._
+_This is not a usable contract language yet. Right now the project has a small
+front end and the first verifier path._
 
     model Counter {
         value: int
@@ -19,8 +19,11 @@ start of the front end: parsing and basic semantic checks._
         must [ value >= 0 ]
     }
 
-    fn increment(amount: int) when Ready -> Ready
-    must [ amount > 0 ]
+    fn increment(amount: int) when Ready as before -> Ready as after
+    must [
+        amount > 0,
+        after.value == before.value + amount
+    ]
     {
         skip;
     }
@@ -28,3 +31,4 @@ start of the front end: parsing and basic semantic checks._
 Run the checks:
 
     cargo run -- check examples/counter.may
+    cargo run -- verify examples/counter.may

@@ -70,7 +70,9 @@ pub struct ParameterDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateTransitionDefinition {
     pub from: String,
+    pub from_alias: Option<String>,
     pub to: String,
+    pub to_alias: Option<String>,
     pub span: Span,
 }
 
@@ -162,6 +164,21 @@ struct Checker {
     errors: Vec<SemanticError>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ExpressionScope {
+    values: HashMap<String, SemanticType>,
+    fields: HashMap<String, HashMap<String, SemanticType>>,
+}
+
+impl ExpressionScope {
+    fn from_values(values: HashMap<String, SemanticType>) -> Self {
+        Self {
+            values,
+            fields: HashMap::new(),
+        }
+    }
+}
+
 impl Checker {
     fn collect_declarations(&mut self, source: &Source) {
         for declaration in &source.declarations {
@@ -211,7 +228,9 @@ impl Checker {
         for declaration in &source.declarations {
             match declaration {
                 Declaration::Model(model) => {
-                    if let Some(scope) = self.model_fields.get(&model.name.text).cloned() {
+                    if let Some(fields) = self.model_fields.get(&model.name.text).cloned() {
+                        let scope = ExpressionScope::from_values(fields);
+
                         for item in &model.items {
                             if let ModelItem::Constraint(block) = item {
                                 self.check_must_block(&model.name, &scope, block);
@@ -220,12 +239,12 @@ impl Checker {
                     }
                 }
                 Declaration::State(state) => {
-                    let mut scope = HashMap::new();
+                    let mut scope = ExpressionScope::default();
 
                     if let Some(model) = &state.model {
                         self.check_model_reference(&state.name, model);
                         if let Some(model_fields) = self.model_fields.get(&model.text) {
-                            scope = model_fields.clone();
+                            scope.values = model_fields.clone();
                         }
                     }
 
@@ -234,7 +253,7 @@ impl Checker {
                     }
                 }
                 Declaration::Function(function) => {
-                    let mut scope = HashMap::new();
+                    let mut scope = ExpressionScope::default();
 
                     for param in &function.params {
                         self.check_type(&param.ty);
@@ -244,6 +263,7 @@ impl Checker {
                     if let Some(transition) = &function.transition {
                         self.check_state_reference(&function.name, &transition.from);
                         self.check_state_reference(&function.name, &transition.to);
+                        self.add_transition_aliases(source, &function.name, transition, &mut scope);
                     }
 
                     for block in &function.constraints {
@@ -300,7 +320,12 @@ impl Checker {
                     transition: function.transition.as_ref().map(|transition| {
                         StateTransitionDefinition {
                             from: transition.from.text.clone(),
+                            from_alias: transition
+                                .from_alias
+                                .as_ref()
+                                .map(|alias| alias.text.clone()),
                             to: transition.to.text.clone(),
+                            to_alias: transition.to_alias.as_ref().map(|alias| alias.text.clone()),
                             span: transition.span,
                         }
                     }),
@@ -423,9 +448,9 @@ impl Checker {
         &mut self,
         function_name: &Identifier,
         param: &Parameter,
-        scope: &mut HashMap<String, SemanticType>,
+        scope: &mut ExpressionScope,
     ) {
-        if scope.contains_key(&param.name.text) {
+        if scope.values.contains_key(&param.name.text) {
             self.errors.push(SemanticError::new(
                 format!(
                     "{} already has a parameter named {}",
@@ -436,13 +461,82 @@ impl Checker {
             return;
         }
 
-        scope.insert(param.name.text.clone(), self.resolve_type(&param.ty));
+        scope.values.insert(param.name.text.clone(), self.resolve_type(&param.ty));
+    }
+
+    fn add_transition_aliases(
+        &mut self,
+        source: &Source,
+        function_name: &Identifier,
+        transition: &parser::ast::StateTransition,
+        scope: &mut ExpressionScope,
+    ) {
+        self.add_state_alias_to_scope(
+            source,
+            function_name,
+            &transition.from,
+            transition.from_alias.as_ref(),
+            scope,
+        );
+        self.add_state_alias_to_scope(
+            source,
+            function_name,
+            &transition.to,
+            transition.to_alias.as_ref(),
+            scope,
+        );
+    }
+
+    fn add_state_alias_to_scope(
+        &mut self,
+        source: &Source,
+        function_name: &Identifier,
+        state: &Identifier,
+        alias: Option<&Identifier>,
+        scope: &mut ExpressionScope,
+    ) {
+        let Some(alias) = alias else {
+            return;
+        };
+
+        if scope.values.contains_key(&alias.text) || scope.fields.contains_key(&alias.text) {
+            self.errors.push(SemanticError::new(
+                format!(
+                    "{} already has a binding named {}",
+                    function_name.text, alias.text
+                ),
+                alias.span,
+            ));
+        }
+
+        let Some(fields) = self.state_fields_for_scope(source, &state.text) else {
+            return;
+        };
+
+        scope.fields.entry(alias.text.clone()).or_insert(fields);
+    }
+
+    fn state_fields_for_scope(
+        &self,
+        source: &Source,
+        state_name: &str,
+    ) -> Option<HashMap<String, SemanticType>> {
+        source.declarations.iter().find_map(|declaration| match declaration {
+            Declaration::State(state) if state.name.text == state_name => Some(
+                state
+                    .model
+                    .as_ref()
+                    .and_then(|model| self.model_fields.get(&model.text).cloned())
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        })
     }
 
     fn check_must_block(
         &mut self,
         owner_name: &Identifier,
-        scope: &HashMap<String, SemanticType>,
+        scope: &ExpressionScope,
         block: &ConstraintBlock,
     ) {
         for expression in &block.expressions {
@@ -464,11 +558,11 @@ impl Checker {
     fn infer_expression(
         &mut self,
         owner_name: &Identifier,
-        scope: &HashMap<String, SemanticType>,
+        scope: &ExpressionScope,
         expression: &Expression,
     ) -> SemanticType {
         match expression {
-            Expression::Identifier(identifier) => match scope.get(&identifier.text) {
+            Expression::Identifier(identifier) => match scope.values.get(&identifier.text) {
                 Some(ty) => ty.clone(),
                 None => {
                     self.errors.push(SemanticError::new(
@@ -481,6 +575,32 @@ impl Checker {
                     SemanticType::Unknown
                 }
             },
+            Expression::FieldAccess { base, field, .. } => {
+                let Some(fields) = scope.fields.get(&base.text) else {
+                    self.errors.push(SemanticError::new(
+                        format!(
+                            "{} must block refers to unknown state alias {}",
+                            owner_name.text, base.text
+                        ),
+                        base.span,
+                    ));
+                    return SemanticType::Unknown;
+                };
+
+                match fields.get(&field.text) {
+                    Some(ty) => ty.clone(),
+                    None => {
+                        self.errors.push(SemanticError::new(
+                            format!(
+                                "{} must block refers to unknown field {}.{}",
+                                owner_name.text, base.text, field.text
+                            ),
+                            field.span,
+                        ));
+                        SemanticType::Unknown
+                    }
+                }
+            }
             Expression::Integer(_) => SemanticType::IntegerLiteral,
             Expression::Binary { lhs, op, rhs, span } => {
                 let lhs_ty = self.infer_expression(owner_name, scope, lhs);
@@ -751,11 +871,55 @@ must [ amount > 0 ]
             Some("Ready")
         );
         assert_eq!(
+            increment
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.from_alias.as_deref()),
+            None
+        );
+        assert_eq!(
             increment.transition.as_ref().map(|transition| transition.to.as_str()),
             Some("Ready")
         );
+        assert_eq!(
+            increment
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.to_alias.as_deref()),
+            None
+        );
         assert_eq!(increment.bounds.expressions.len(), 1);
         assert_eq!(increment.body.len(), 1);
+    }
+
+    #[test]
+    fn accepts_transition_alias_field_bounds() {
+        let source = parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    skip;
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let definition = check(&source).expect("source should be semantically valid");
+        let increment = &definition.functions[0];
+        let transition = increment.transition.as_ref().expect("expected state transition");
+
+        assert_eq!(transition.from, "Ready");
+        assert_eq!(transition.from_alias.as_deref(), Some("before"));
+        assert_eq!(transition.to, "Ready");
+        assert_eq!(transition.to_alias.as_deref(), Some("after"));
+        assert_eq!(increment.bounds.expressions.len(), 1);
     }
 
     #[test]
@@ -950,6 +1114,81 @@ fn increment(amount: int) must [ missing > 0 ] {
             errors
                 .iter()
                 .any(|error| error == "increment must block refers to unknown identifier missing")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_transition_alias_field_access() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ current.value == amount ]
+{
+    skip;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment must block refers to unknown state alias current")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_transition_field_access() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ before.missing == amount ]
+{
+    skip;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment must block refers to unknown field before.missing")
+        );
+    }
+
+    #[test]
+    fn rejects_transition_alias_collisions() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as amount -> Ready as after
+must [ after.value == amount ]
+{
+    skip;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment already has a binding named amount")
         );
     }
 

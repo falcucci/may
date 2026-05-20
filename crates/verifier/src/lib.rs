@@ -9,6 +9,7 @@ use semantics::FieldDefinition;
 use semantics::FunctionDefinition;
 use semantics::ParameterDefinition;
 use semantics::StateDefinition;
+use semantics::StateTransitionDefinition;
 use semantics::Type;
 use z3::SatResult;
 use z3::Solver;
@@ -284,8 +285,10 @@ pub fn verify_with_backend(
         verifier.verify_state(state);
     }
 
+    let state_fields = state_fields_by_name(&contract.states);
+
     for function in &contract.functions {
-        verifier.verify_function(function);
+        verifier.verify_function(function, &state_fields);
     }
 
     if verifier.errors.is_empty() {
@@ -312,14 +315,35 @@ struct Verifier {
     errors: Vec<VerificationError>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct VerifiedScope {
+    values: HashMap<String, VerifiedType>,
+    fields: HashMap<String, HashMap<String, VerifiedType>>,
+}
+
+impl VerifiedScope {
+    fn from_values(values: HashMap<String, VerifiedType>) -> Self {
+        Self {
+            values,
+            fields: HashMap::new(),
+        }
+    }
+}
+
 impl Verifier {
     fn verify_state(&mut self, state: &StateDefinition) {
         let scope = scope_from_fields(&state.fields);
         self.verify_bounds(BoundOwner::State(state.name.clone()), &state.bounds, &scope);
     }
 
-    fn verify_function(&mut self, function: &FunctionDefinition) {
+    fn verify_function(
+        &mut self,
+        function: &FunctionDefinition,
+        state_fields: &HashMap<String, HashMap<String, VerifiedType>>,
+    ) {
         let scope = scope_from_params(&function.params);
+        let scope =
+            scope_with_transition_aliases(scope, function.transition.as_ref(), state_fields);
         self.verify_bounds(
             BoundOwner::Function(function.name.clone()),
             &function.bounds,
@@ -327,12 +351,7 @@ impl Verifier {
         );
     }
 
-    fn verify_bounds(
-        &mut self,
-        owner: BoundOwner,
-        bounds: &Bounds,
-        scope: &HashMap<String, VerifiedType>,
-    ) {
+    fn verify_bounds(&mut self, owner: BoundOwner, bounds: &Bounds, scope: &VerifiedScope) {
         if !is_valid_span(bounds.span) {
             self.errors.push(VerificationError::new(
                 "bound owner has an invalid span",
@@ -380,11 +399,11 @@ impl Verifier {
     fn lower_expression(
         &mut self,
         expression: &ast::Expression,
-        scope: &HashMap<String, VerifiedType>,
+        scope: &VerifiedScope,
     ) -> Option<VerifiedExpression> {
         match expression {
             ast::Expression::Identifier(identifier) => {
-                let Some(ty) = scope.get(&identifier.text) else {
+                let Some(ty) = scope.values.get(&identifier.text) else {
                     self.errors.push(VerificationError::new(
                         format!(
                             "bound expression refers to unknown identifier {}",
@@ -399,6 +418,35 @@ impl Verifier {
                     name: identifier.text.clone(),
                     ty: ty.clone(),
                     span: identifier.span,
+                })
+            }
+            ast::Expression::FieldAccess { base, field, span } => {
+                let Some(fields) = scope.fields.get(&base.text) else {
+                    self.errors.push(VerificationError::new(
+                        format!(
+                            "bound expression refers to unknown state alias {}",
+                            base.text
+                        ),
+                        base.span,
+                    ));
+                    return None;
+                };
+
+                let Some(ty) = fields.get(&field.text) else {
+                    self.errors.push(VerificationError::new(
+                        format!(
+                            "bound expression refers to unknown field {}.{}",
+                            base.text, field.text
+                        ),
+                        field.span,
+                    ));
+                    return None;
+                };
+
+                Some(VerifiedExpression::Identifier {
+                    name: format!("{}.{}", base.text, field.text),
+                    ty: ty.clone(),
+                    span: *span,
                 })
             }
             ast::Expression::Integer(integer) => Some(VerifiedExpression::IntLiteral {
@@ -538,17 +586,77 @@ fn z3_int(expression: &VerifiedExpression) -> Option<Int> {
     }
 }
 
-fn scope_from_fields(fields: &[FieldDefinition]) -> HashMap<String, VerifiedType> {
-    fields
+fn scope_from_fields(fields: &[FieldDefinition]) -> VerifiedScope {
+    VerifiedScope::from_values(
+        fields
+            .iter()
+            .map(|field| (field.name.clone(), VerifiedType::from(&field.ty)))
+            .collect(),
+    )
+}
+
+fn scope_from_params(params: &[ParameterDefinition]) -> VerifiedScope {
+    VerifiedScope::from_values(
+        params
+            .iter()
+            .map(|param| (param.name.clone(), VerifiedType::from(&param.ty)))
+            .collect(),
+    )
+}
+
+fn scope_with_transition_aliases(
+    mut scope: VerifiedScope,
+    transition: Option<&StateTransitionDefinition>,
+    state_fields: &HashMap<String, HashMap<String, VerifiedType>>,
+) -> VerifiedScope {
+    let Some(transition) = transition else {
+        return scope;
+    };
+
+    add_transition_alias(
+        &mut scope,
+        transition.from_alias.as_deref(),
+        &transition.from,
+        state_fields,
+    );
+    add_transition_alias(
+        &mut scope,
+        transition.to_alias.as_deref(),
+        &transition.to,
+        state_fields,
+    );
+
+    scope
+}
+
+fn add_transition_alias(
+    scope: &mut VerifiedScope,
+    alias: Option<&str>,
+    state: &str,
+    state_fields: &HashMap<String, HashMap<String, VerifiedType>>,
+) {
+    let Some(alias) = alias else {
+        return;
+    };
+
+    if let Some(fields) = state_fields.get(state) {
+        scope.fields.insert(alias.to_owned(), fields.clone());
+    }
+}
+
+fn state_fields_by_name(
+    states: &[StateDefinition],
+) -> HashMap<String, HashMap<String, VerifiedType>> {
+    states
         .iter()
-        .map(|field| (field.name.clone(), VerifiedType::from(&field.ty)))
+        .map(|state| (state.name.clone(), field_scope_from_fields(&state.fields)))
         .collect()
 }
 
-fn scope_from_params(params: &[ParameterDefinition]) -> HashMap<String, VerifiedType> {
-    params
+fn field_scope_from_fields(fields: &[FieldDefinition]) -> HashMap<String, VerifiedType> {
+    fields
         .iter()
-        .map(|param| (param.name.clone(), VerifiedType::from(&param.ty)))
+        .map(|field| (field.name.clone(), VerifiedType::from(&field.ty)))
         .collect()
 }
 
@@ -677,6 +785,40 @@ model Counter {
     }
 
     #[test]
+    fn lowers_transition_alias_fields_to_solver_symbols() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    skip;
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 1);
+        assert_eq!(report.accepted_constraints(), 1);
+        assert!(expression_has_identifier(
+            &report.constraints[0].expression,
+            "after.value"
+        ));
+        assert!(expression_has_identifier(
+            &report.constraints[0].expression,
+            "before.value"
+        ));
+    }
+
+    #[test]
     fn z3_backend_rejects_unsatisfiable_integer_constraints() {
         let source = parser::parse_source(
             r#"
@@ -729,6 +871,34 @@ model Counter {
             r#"
 model Broken {
     must [ 1 + 1 == 3 ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 1);
+        assert_eq!(report.accepted_constraints(), 0);
+        assert_eq!(report.rejected_constraints(), 1);
+        assert_eq!(report.unsupported_constraints(), 0);
+    }
+
+    #[test]
+    fn z3_backend_rejects_unsatisfiable_transition_field_constraints() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment() when Ready as before -> Ready as after
+must [ before.value + 1 == before.value ]
+{
+    skip;
 }
 "#,
         )
@@ -825,5 +995,15 @@ model Broken {
                     )
                 )
         }));
+    }
+
+    fn expression_has_identifier(expression: &VerifiedExpression, name: &str) -> bool {
+        match expression {
+            VerifiedExpression::Identifier { name: ident, .. } => ident == name,
+            VerifiedExpression::Binary { lhs, rhs, .. } => {
+                expression_has_identifier(lhs, name) || expression_has_identifier(rhs, name)
+            }
+            VerifiedExpression::IntLiteral { .. } => false,
+        }
     }
 }

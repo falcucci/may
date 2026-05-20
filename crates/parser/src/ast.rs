@@ -46,7 +46,9 @@ pub struct FunctionDeclaration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateTransition {
     pub from: Identifier,
+    pub from_alias: Option<Identifier>,
     pub to: Identifier,
+    pub to_alias: Option<Identifier>,
     pub span: Span,
 }
 
@@ -97,6 +99,11 @@ impl Statement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expression {
     Identifier(Identifier),
+    FieldAccess {
+        base: Identifier,
+        field: Identifier,
+        span: Span,
+    },
     Integer(IntegerLiteral),
     Binary {
         lhs: Box<Expression>,
@@ -110,6 +117,7 @@ impl Expression {
     pub fn span(&self) -> Span {
         match self {
             Expression::Identifier(identifier) => identifier.span,
+            Expression::FieldAccess { span, .. } => *span,
             Expression::Integer(integer) => integer.span,
             Expression::Binary { span, .. } => *span,
         }
