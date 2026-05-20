@@ -38,6 +38,8 @@ pub enum Token {
     Fn,
     #[token("when")]
     When,
+    #[token("as")]
+    As,
     #[token("must")]
     Must,
     #[token("skip")]
@@ -76,6 +78,8 @@ pub enum Token {
     Comma,
     #[token(";")]
     Semicolon,
+    #[token(".")]
+    Dot,
     #[token("->")]
     Arrow,
     #[token(">=")]
@@ -109,6 +113,7 @@ impl Token {
             Token::State => "state",
             Token::Fn => "fn",
             Token::When => "when",
+            Token::As => "as",
             Token::Must => "must",
             Token::Skip => "skip",
             Token::Int => "int",
@@ -128,6 +133,7 @@ impl Token {
             Token::Colon => ":",
             Token::Comma => ",",
             Token::Semicolon => ";",
+            Token::Dot => ".",
             Token::Arrow => "->",
             Token::GreaterEqual => ">=",
             Token::LessEqual => "<=",

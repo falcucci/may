@@ -140,9 +140,23 @@ must [ amount > 0 ]
             function.transition.as_ref().map(|transition| transition.from.text.as_str()),
             Some("Ready")
         );
+        assert!(
+            function
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.from_alias.as_ref())
+                .is_none()
+        );
         assert_eq!(
             function.transition.as_ref().map(|transition| transition.to.text.as_str()),
             Some("Ready")
+        );
+        assert!(
+            function
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.to_alias.as_ref())
+                .is_none()
         );
         assert_eq!(function.constraints.len(), 1);
         assert!(matches!(function.body.as_slice(), [Statement::Skip { .. }]));
@@ -172,5 +186,61 @@ model Counter {
             panic!("expected binary expression");
         };
         assert_eq!(*op, BinaryOperator::GreaterEqual);
+    }
+
+    #[test]
+    fn parses_transition_aliases_and_field_access() {
+        let source = parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    skip;
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let Declaration::Function(function) = &source.declarations[2] else {
+            panic!("expected function declaration");
+        };
+        let transition = function.transition.as_ref().expect("expected state transition");
+        assert_eq!(
+            transition.from_alias.as_ref().map(|alias| alias.text.as_str()),
+            Some("before")
+        );
+        assert_eq!(
+            transition.to_alias.as_ref().map(|alias| alias.text.as_str()),
+            Some("after")
+        );
+
+        let Expression::Binary { lhs, rhs, op, .. } = &function.constraints[0].expressions[0]
+        else {
+            panic!("expected equality expression");
+        };
+        assert_eq!(*op, BinaryOperator::Equal);
+        assert!(matches!(
+            lhs.as_ref(),
+            Expression::FieldAccess { base, field, .. }
+                if base.text == "after" && field.text == "value"
+        ));
+        assert!(matches!(
+            rhs.as_ref(),
+            Expression::Binary {
+                lhs,
+                op: BinaryOperator::Add,
+                ..
+            } if matches!(
+                lhs.as_ref(),
+                Expression::FieldAccess { base, field, .. }
+                    if base.text == "before" && field.text == "value"
+            )
+        ));
     }
 }

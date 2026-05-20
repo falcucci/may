@@ -8,8 +8,11 @@ state Ready(Counter) {
     must [ value >= 0 ]
 }
 
-fn increment(amount: int) when Ready -> Ready
-must [ amount > 0 ]
+fn increment(amount: int) when Ready as before -> Ready as after
+must [
+    amount > 0,
+    after.value == before.value + amount
+]
 {
     skip;
 }
