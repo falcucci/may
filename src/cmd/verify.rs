@@ -41,9 +41,18 @@ impl VerifyCommand {
         match verifier::verify(&contract) {
             Ok(report) => {
                 println!(
-                    "Program is structurally verified: {} bounds checked.",
-                    report.checked_bounds
+                    "Program verified: {} bounds checked, {} accepted, {} rejected, {} unknown, \
+                     {} unsupported.",
+                    report.checked_bounds,
+                    report.accepted_constraints(),
+                    report.rejected_constraints(),
+                    report.unknown_constraints(),
+                    report.unsupported_constraints()
                 );
+
+                if report.rejected_constraints() > 0 {
+                    process::exit(1);
+                }
             }
             Err(errors) => {
                 for error in errors {
