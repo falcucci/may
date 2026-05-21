@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -118,6 +119,19 @@ pub struct TransitionProofResult {
     pub goal_owner: BoundOwner,
     pub span: Span,
     pub result: SolverResult,
+    pub counterexample: Vec<CounterexampleValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterexampleValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionProofOutcome {
+    pub result: SolverResult,
+    pub counterexample: Vec<CounterexampleValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +299,7 @@ impl std::error::Error for VerificationError {}
 
 pub trait SolverBackend {
     fn check_constraint(&self, constraint: &Constraint) -> SolverResult;
-    fn prove_transition(&self, proof: &TransitionProof) -> SolverResult;
+    fn prove_transition(&self, proof: &TransitionProof) -> TransitionProofOutcome;
 }
 
 #[derive(Debug, Default)]
@@ -294,7 +308,12 @@ pub struct StructuralBackend;
 impl SolverBackend for StructuralBackend {
     fn check_constraint(&self, _constraint: &Constraint) -> SolverResult { SolverResult::Accepted }
 
-    fn prove_transition(&self, _proof: &TransitionProof) -> SolverResult { SolverResult::Accepted }
+    fn prove_transition(&self, _proof: &TransitionProof) -> TransitionProofOutcome {
+        TransitionProofOutcome {
+            result: SolverResult::Accepted,
+            counterexample: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -318,31 +337,46 @@ impl SolverBackend for Z3Backend {
         }
     }
 
-    fn prove_transition(&self, proof: &TransitionProof) -> SolverResult {
+    fn prove_transition(&self, proof: &TransitionProof) -> TransitionProofOutcome {
         let solver = Solver::new();
 
         for assumption in &proof.assumptions {
             let Some(expression) = z3_bool(&assumption.expression) else {
-                return SolverResult::Unsupported(
-                    "transition assumption is not supported by the Z3 backend yet".to_owned(),
-                );
+                return TransitionProofOutcome {
+                    result: SolverResult::Unsupported(
+                        "transition assumption is not supported by the Z3 backend yet".to_owned(),
+                    ),
+                    counterexample: Vec::new(),
+                };
             };
 
             solver.assert(&expression);
         }
 
         let Some(goal) = z3_bool(&proof.goal.expression) else {
-            return SolverResult::Unsupported(
-                "transition goal is not supported by the Z3 backend yet".to_owned(),
-            );
+            return TransitionProofOutcome {
+                result: SolverResult::Unsupported(
+                    "transition goal is not supported by the Z3 backend yet".to_owned(),
+                ),
+                counterexample: Vec::new(),
+            };
         };
 
         solver.assert(&goal.not());
 
         match solver.check() {
-            SatResult::Sat => SolverResult::Rejected,
-            SatResult::Unsat => SolverResult::Accepted,
-            SatResult::Unknown => SolverResult::Unknown,
+            SatResult::Sat => TransitionProofOutcome {
+                result: SolverResult::Rejected,
+                counterexample: z3_counterexample(&solver, proof),
+            },
+            SatResult::Unsat => TransitionProofOutcome {
+                result: SolverResult::Accepted,
+                counterexample: Vec::new(),
+            },
+            SatResult::Unknown => TransitionProofOutcome {
+                result: SolverResult::Unknown,
+                counterexample: Vec::new(),
+            },
         }
     }
 }
@@ -389,13 +423,18 @@ pub fn verify_with_backend(
         report.transition_results = report
             .transition_proofs
             .iter()
-            .map(|proof| TransitionProofResult {
-                function: proof.function.clone(),
-                from: proof.from.clone(),
-                to: proof.to.clone(),
-                goal_owner: proof.goal.owner.clone(),
-                span: proof.goal.span,
-                result: backend.prove_transition(proof),
+            .map(|proof| {
+                let outcome = backend.prove_transition(proof);
+
+                TransitionProofResult {
+                    function: proof.function.clone(),
+                    from: proof.from.clone(),
+                    to: proof.to.clone(),
+                    goal_owner: proof.goal.owner.clone(),
+                    span: proof.goal.span,
+                    result: outcome.result,
+                    counterexample: outcome.counterexample,
+                }
             })
             .collect();
 
@@ -811,6 +850,59 @@ fn z3_int(expression: &VerifiedExpression) -> Option<Int> {
     }
 }
 
+fn z3_counterexample(solver: &Solver, proof: &TransitionProof) -> Vec<CounterexampleValue> {
+    let Some(model) = solver.get_model() else {
+        return Vec::new();
+    };
+
+    collect_proof_symbols(proof)
+        .into_iter()
+        .filter_map(|(name, ty)| {
+            let value = match ty {
+                VerifiedType::Int | VerifiedType::UInt | VerifiedType::IntegerLiteral => {
+                    model.eval(&Int::new_const(name.as_str()), true).map(|value| value.to_string())
+                }
+                VerifiedType::Bool => {
+                    model.eval(&Bool::new_const(name.as_str()), true).map(|value| value.to_string())
+                }
+                VerifiedType::String
+                | VerifiedType::Address
+                | VerifiedType::Hex
+                | VerifiedType::Custom(_) => None,
+            }?;
+
+            Some(CounterexampleValue { name, value })
+        })
+        .collect()
+}
+
+fn collect_proof_symbols(proof: &TransitionProof) -> BTreeMap<String, VerifiedType> {
+    let mut symbols = BTreeMap::new();
+    for assumption in &proof.assumptions {
+        collect_expression_symbols(&assumption.expression, &mut symbols);
+    }
+
+    collect_expression_symbols(&proof.goal.expression, &mut symbols);
+
+    symbols
+}
+
+fn collect_expression_symbols(
+    expression: &VerifiedExpression,
+    symbols: &mut BTreeMap<String, VerifiedType>,
+) {
+    match expression {
+        VerifiedExpression::Identifier { name, ty, .. } => {
+            symbols.entry(name.clone()).or_insert_with(|| ty.clone());
+        }
+        VerifiedExpression::Binary { lhs, rhs, .. } => {
+            collect_expression_symbols(lhs, symbols);
+            collect_expression_symbols(rhs, symbols);
+        }
+        VerifiedExpression::IntLiteral { .. } => {}
+    }
+}
+
 fn scope_from_fields(fields: &[FieldDefinition]) -> VerifiedScope {
     VerifiedScope::from_values(
         fields
@@ -1153,6 +1245,9 @@ must [ after.value == before.value + amount ]
         assert_eq!(report.proved_transition_goals(), 0);
         assert_eq!(report.failed_transition_goals(), 1);
         assert_eq!(report.transition_results[0].result, SolverResult::Rejected);
+        assert!(counterexample_value(&report.transition_results[0], "amount").is_some());
+        assert!(counterexample_value(&report.transition_results[0], "before.value").is_some());
+        assert!(counterexample_value(&report.transition_results[0], "after.value").is_some());
     }
 
     #[test]
@@ -1342,5 +1437,16 @@ must [ before.value + 1 == before.value ]
             }
             VerifiedExpression::IntLiteral { .. } => false,
         }
+    }
+
+    fn counterexample_value<'a>(
+        result: &'a super::TransitionProofResult,
+        name: &str,
+    ) -> Option<&'a str> {
+        result
+            .counterexample
+            .iter()
+            .find(|value| value.name == name)
+            .map(|value| value.value.as_str())
     }
 }
