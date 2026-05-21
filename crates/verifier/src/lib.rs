@@ -7,6 +7,7 @@ use semantics::Bounds;
 use semantics::ContractDefinition;
 use semantics::FieldDefinition;
 use semantics::FunctionDefinition;
+use semantics::ModelDefinition;
 use semantics::ParameterDefinition;
 use semantics::StateDefinition;
 use semantics::StateTransitionDefinition;
@@ -24,6 +25,8 @@ pub struct VerificationReport {
     pub function_bounds: usize,
     pub constraints: Vec<Constraint>,
     pub solver_results: Vec<ConstraintSolverResult>,
+    pub transition_proofs: Vec<TransitionProof>,
+    pub transition_results: Vec<TransitionProofResult>,
 }
 
 impl VerificationReport {
@@ -54,6 +57,34 @@ impl VerificationReport {
             .filter(|result| matches!(result.result, SolverResult::Unsupported(_)))
             .count()
     }
+
+    pub fn proved_transition_goals(&self) -> usize {
+        self.transition_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Accepted)
+            .count()
+    }
+
+    pub fn failed_transition_goals(&self) -> usize {
+        self.transition_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Rejected)
+            .count()
+    }
+
+    pub fn unknown_transition_goals(&self) -> usize {
+        self.transition_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Unknown)
+            .count()
+    }
+
+    pub fn unsupported_transition_goals(&self) -> usize {
+        self.transition_results
+            .iter()
+            .filter(|result| matches!(result.result, SolverResult::Unsupported(_)))
+            .count()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +97,25 @@ pub struct Constraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstraintSolverResult {
     pub owner: BoundOwner,
+    pub span: Span,
+    pub result: SolverResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionProof {
+    pub function: String,
+    pub from: String,
+    pub to: String,
+    pub assumptions: Vec<Constraint>,
+    pub goal: Constraint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionProofResult {
+    pub function: String,
+    pub from: String,
+    pub to: String,
+    pub goal_owner: BoundOwner,
     pub span: Span,
     pub result: SolverResult,
 }
@@ -235,6 +285,7 @@ impl std::error::Error for VerificationError {}
 
 pub trait SolverBackend {
     fn check_constraint(&self, constraint: &Constraint) -> SolverResult;
+    fn prove_transition(&self, proof: &TransitionProof) -> SolverResult;
 }
 
 #[derive(Debug, Default)]
@@ -242,6 +293,8 @@ pub struct StructuralBackend;
 
 impl SolverBackend for StructuralBackend {
     fn check_constraint(&self, _constraint: &Constraint) -> SolverResult { SolverResult::Accepted }
+
+    fn prove_transition(&self, _proof: &TransitionProof) -> SolverResult { SolverResult::Accepted }
 }
 
 #[derive(Debug, Default)]
@@ -264,6 +317,34 @@ impl SolverBackend for Z3Backend {
             SatResult::Unknown => SolverResult::Unknown,
         }
     }
+
+    fn prove_transition(&self, proof: &TransitionProof) -> SolverResult {
+        let solver = Solver::new();
+
+        for assumption in &proof.assumptions {
+            let Some(expression) = z3_bool(&assumption.expression) else {
+                return SolverResult::Unsupported(
+                    "transition assumption is not supported by the Z3 backend yet".to_owned(),
+                );
+            };
+
+            solver.assert(&expression);
+        }
+
+        let Some(goal) = z3_bool(&proof.goal.expression) else {
+            return SolverResult::Unsupported(
+                "transition goal is not supported by the Z3 backend yet".to_owned(),
+            );
+        };
+
+        solver.assert(&goal.not());
+
+        match solver.check() {
+            SatResult::Sat => SolverResult::Rejected,
+            SatResult::Unsat => SolverResult::Accepted,
+            SatResult::Unknown => SolverResult::Unknown,
+        }
+    }
 }
 
 pub fn verify(contract: &ContractDefinition) -> Result<VerificationReport, Vec<VerificationError>> {
@@ -275,6 +356,8 @@ pub fn verify_with_backend(
     backend: &impl SolverBackend,
 ) -> Result<VerificationReport, Vec<VerificationError>> {
     let mut verifier = Verifier::default();
+    let models = models_by_name(&contract.models);
+    let states = states_by_name(&contract.states);
 
     for model in &contract.models {
         let scope = scope_from_fields(&model.fields);
@@ -289,6 +372,7 @@ pub fn verify_with_backend(
 
     for function in &contract.functions {
         verifier.verify_function(function, &state_fields);
+        verifier.verify_transition_proofs(function, &models, &states, &state_fields);
     }
 
     if verifier.errors.is_empty() {
@@ -300,6 +384,18 @@ pub fn verify_with_backend(
                 owner: constraint.owner.clone(),
                 span: constraint.span,
                 result: backend.check_constraint(constraint),
+            })
+            .collect();
+        report.transition_results = report
+            .transition_proofs
+            .iter()
+            .map(|proof| TransitionProofResult {
+                function: proof.function.clone(),
+                from: proof.from.clone(),
+                to: proof.to.clone(),
+                goal_owner: proof.goal.owner.clone(),
+                span: proof.goal.span,
+                result: backend.prove_transition(proof),
             })
             .collect();
 
@@ -317,17 +413,23 @@ struct Verifier {
 
 #[derive(Debug, Clone, Default)]
 struct VerifiedScope {
-    values: HashMap<String, VerifiedType>,
+    values: HashMap<String, VerifiedValue>,
     fields: HashMap<String, HashMap<String, VerifiedType>>,
 }
 
 impl VerifiedScope {
-    fn from_values(values: HashMap<String, VerifiedType>) -> Self {
+    fn from_values(values: HashMap<String, VerifiedValue>) -> Self {
         Self {
             values,
             fields: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedValue {
+    symbol: String,
+    ty: VerifiedType,
 }
 
 impl Verifier {
@@ -351,13 +453,140 @@ impl Verifier {
         );
     }
 
+    fn verify_transition_proofs(
+        &mut self,
+        function: &FunctionDefinition,
+        models: &HashMap<String, &ModelDefinition>,
+        states: &HashMap<String, &StateDefinition>,
+        state_fields: &HashMap<String, HashMap<String, VerifiedType>>,
+    ) {
+        let Some(transition) = &function.transition else {
+            return;
+        };
+
+        let (Some(from_alias), Some(to_alias)) = (
+            transition.from_alias.as_deref(),
+            transition.to_alias.as_deref(),
+        ) else {
+            return;
+        };
+
+        let Some(from_state) = states.get(&transition.from).copied() else {
+            return;
+        };
+
+        let Some(to_state) = states.get(&transition.to).copied() else {
+            return;
+        };
+
+        let mut assumptions = Vec::new();
+        self.add_state_assumptions(from_alias, from_state, models, &mut assumptions);
+
+        let function_scope = scope_with_transition_aliases(
+            scope_from_params(&function.params),
+            Some(transition),
+            state_fields,
+        );
+
+        assumptions.extend(self.lower_constraints(
+            BoundOwner::Function(function.name.clone()),
+            &function.bounds,
+            &function_scope,
+        ));
+
+        let goals = self.transition_goals(to_alias, to_state, models);
+        for goal in goals {
+            self.report.transition_proofs.push(TransitionProof {
+                function: function.name.clone(),
+                from: transition.from.clone(),
+                to: transition.to.clone(),
+                assumptions: assumptions.clone(),
+                goal,
+            });
+        }
+    }
+
+    fn add_state_assumptions(
+        &mut self,
+        alias: &str,
+        state: &StateDefinition,
+        models: &HashMap<String, &ModelDefinition>,
+        assumptions: &mut Vec<Constraint>,
+    ) {
+        if let Some(model_name) = &state.model {
+            if let Some(model) = models.get(model_name).copied() {
+                let scope = scope_from_fields_with_prefix(alias, &model.fields);
+                assumptions.extend(self.lower_constraints(
+                    BoundOwner::Model(model.name.clone()),
+                    &model.bounds,
+                    &scope,
+                ));
+            }
+        }
+
+        let scope = scope_from_fields_with_prefix(alias, &state.fields);
+        assumptions.extend(self.lower_constraints(
+            BoundOwner::State(state.name.clone()),
+            &state.bounds,
+            &scope,
+        ));
+    }
+
+    fn transition_goals(
+        &mut self,
+        alias: &str,
+        state: &StateDefinition,
+        models: &HashMap<String, &ModelDefinition>,
+    ) -> Vec<Constraint> {
+        let mut goals = Vec::new();
+        if let Some(model_name) = &state.model {
+            if let Some(model) = models.get(model_name).copied() {
+                let scope = scope_from_fields_with_prefix(alias, &model.fields);
+                goals.extend(self.lower_constraints(
+                    BoundOwner::Model(model.name.clone()),
+                    &model.bounds,
+                    &scope,
+                ));
+            }
+        }
+
+        let scope = scope_from_fields_with_prefix(alias, &state.fields);
+        goals.extend(self.lower_constraints(
+            BoundOwner::State(state.name.clone()),
+            &state.bounds,
+            &scope,
+        ));
+
+        goals
+    }
+
     fn verify_bounds(&mut self, owner: BoundOwner, bounds: &Bounds, scope: &VerifiedScope) {
+        let constraints = self.lower_constraints(owner.clone(), bounds, scope);
+        for constraint in constraints {
+            self.report.checked_bounds += 1;
+            match &owner {
+                BoundOwner::Model(_) => self.report.model_bounds += 1,
+                BoundOwner::State(_) => self.report.state_bounds += 1,
+                BoundOwner::Function(_) => self.report.function_bounds += 1,
+            }
+            self.report.constraints.push(constraint);
+        }
+    }
+
+    fn lower_constraints(
+        &mut self,
+        owner: BoundOwner,
+        bounds: &Bounds,
+        scope: &VerifiedScope,
+    ) -> Vec<Constraint> {
+        let mut constraints = Vec::new();
+
         if !is_valid_span(bounds.span) {
             self.errors.push(VerificationError::new(
                 "bound owner has an invalid span",
                 bounds.span,
             ));
-            return;
+            return constraints;
         }
 
         for expression in &bounds.expressions {
@@ -382,18 +611,14 @@ impl Verifier {
                 continue;
             }
 
-            self.report.checked_bounds += 1;
-            match &owner {
-                BoundOwner::Model(_) => self.report.model_bounds += 1,
-                BoundOwner::State(_) => self.report.state_bounds += 1,
-                BoundOwner::Function(_) => self.report.function_bounds += 1,
-            }
-            self.report.constraints.push(Constraint {
+            constraints.push(Constraint {
                 owner: owner.clone(),
                 span,
                 expression,
             });
         }
+
+        constraints
     }
 
     fn lower_expression(
@@ -403,7 +628,7 @@ impl Verifier {
     ) -> Option<VerifiedExpression> {
         match expression {
             ast::Expression::Identifier(identifier) => {
-                let Some(ty) = scope.values.get(&identifier.text) else {
+                let Some(value) = scope.values.get(&identifier.text) else {
                     self.errors.push(VerificationError::new(
                         format!(
                             "bound expression refers to unknown identifier {}",
@@ -415,8 +640,8 @@ impl Verifier {
                 };
 
                 Some(VerifiedExpression::Identifier {
-                    name: identifier.text.clone(),
-                    ty: ty.clone(),
+                    name: value.symbol.clone(),
+                    ty: value.ty.clone(),
                     span: identifier.span,
                 })
             }
@@ -590,7 +815,32 @@ fn scope_from_fields(fields: &[FieldDefinition]) -> VerifiedScope {
     VerifiedScope::from_values(
         fields
             .iter()
-            .map(|field| (field.name.clone(), VerifiedType::from(&field.ty)))
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    VerifiedValue {
+                        symbol: field.name.clone(),
+                        ty: VerifiedType::from(&field.ty),
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+fn scope_from_fields_with_prefix(prefix: &str, fields: &[FieldDefinition]) -> VerifiedScope {
+    VerifiedScope::from_values(
+        fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    VerifiedValue {
+                        symbol: format!("{}.{}", prefix, field.name),
+                        ty: VerifiedType::from(&field.ty),
+                    },
+                )
+            })
             .collect(),
     )
 }
@@ -599,7 +849,15 @@ fn scope_from_params(params: &[ParameterDefinition]) -> VerifiedScope {
     VerifiedScope::from_values(
         params
             .iter()
-            .map(|param| (param.name.clone(), VerifiedType::from(&param.ty)))
+            .map(|param| {
+                (
+                    param.name.clone(),
+                    VerifiedValue {
+                        symbol: param.name.clone(),
+                        ty: VerifiedType::from(&param.ty),
+                    },
+                )
+            })
             .collect(),
     )
 }
@@ -660,6 +918,14 @@ fn field_scope_from_fields(fields: &[FieldDefinition]) -> HashMap<String, Verifi
         .collect()
 }
 
+fn models_by_name(models: &[ModelDefinition]) -> HashMap<String, &ModelDefinition> {
+    models.iter().map(|model| (model.name.clone(), model)).collect()
+}
+
+fn states_by_name(states: &[StateDefinition]) -> HashMap<String, &StateDefinition> {
+    states.iter().map(|state| (state.name.clone(), state)).collect()
+}
+
 fn is_valid_span(span: Span) -> bool { span.start < span.end }
 
 fn binary_operator_text(op: ast::BinaryOperator) -> &'static str {
@@ -687,6 +953,8 @@ impl Default for VerificationReport {
             function_bounds: 0,
             constraints: Vec::new(),
             solver_results: Vec::new(),
+            transition_proofs: Vec::new(),
+            transition_results: Vec::new(),
         }
     }
 }
@@ -816,6 +1084,75 @@ must [ after.value == before.value + amount ]
             &report.constraints[0].expression,
             "before.value"
         ));
+        assert_eq!(report.transition_proofs.len(), 0);
+        assert_eq!(report.transition_results.len(), 0);
+    }
+
+    #[test]
+    fn z3_backend_proves_transition_target_invariants() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+    must [ value >= 0 ]
+}
+
+state Ready(Counter) {
+    must [ value >= 0 ]
+}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [
+    amount > 0,
+    after.value == before.value + amount
+]
+{
+    skip;
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 4);
+        assert_eq!(report.accepted_constraints(), 4);
+        assert_eq!(report.transition_proofs.len(), 2);
+        assert_eq!(report.proved_transition_goals(), 2);
+        assert_eq!(report.failed_transition_goals(), 0);
+        assert_eq!(report.unsupported_transition_goals(), 0);
+    }
+
+    #[test]
+    fn z3_backend_rejects_unproved_transition_target_invariants() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+    must [ value >= 0 ]
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    skip;
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 2);
+        assert_eq!(report.accepted_constraints(), 2);
+        assert_eq!(report.transition_proofs.len(), 1);
+        assert_eq!(report.proved_transition_goals(), 0);
+        assert_eq!(report.failed_transition_goals(), 1);
+        assert_eq!(report.transition_results[0].result, SolverResult::Rejected);
     }
 
     #[test]
