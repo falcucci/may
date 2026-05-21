@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Args;
+use verifier::SolverResult;
 
 #[derive(Args)]
 pub struct VerifyCommand {
@@ -54,6 +55,21 @@ impl VerifyCommand {
                     report.unknown_transition_goals(),
                     report.unsupported_transition_goals()
                 );
+
+                for result in report
+                    .transition_results
+                    .iter()
+                    .filter(|result| result.result == SolverResult::Rejected)
+                {
+                    println!(
+                        "Counterexample for {} transition {} -> {}:",
+                        result.function, result.from, result.to
+                    );
+
+                    for value in &result.counterexample {
+                        println!("  {} = {}", value.name, value.value);
+                    }
+                }
 
                 if report.rejected_constraints() > 0 || report.failed_transition_goals() > 0 {
                     process::exit(1);
