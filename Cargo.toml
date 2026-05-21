@@ -13,7 +13,7 @@ members = [
 ]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 diagnostics = { path = "crates/diagnostics" }
 parser = { path = "crates/parser" }
 semantics = { path = "crates/semantics" }
