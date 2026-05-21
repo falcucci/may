@@ -8,8 +8,15 @@ use crate::lexer::Span;
 use crate::lexer::Token;
 use crate::lexer::lex;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    Lexer,
+    Parser,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
+    pub kind: ParseErrorKind,
     pub message: String,
     pub span: Span,
 }
@@ -26,6 +33,19 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl diagnostics::ToReport for ParseError {
+    fn to_report(&self) -> diagnostics::Report {
+        match self.kind {
+            ParseErrorKind::Lexer => {
+                diagnostics::Report::lexer(self.span.into(), self.message.clone())
+            }
+            ParseErrorKind::Parser => {
+                diagnostics::Report::parser(self.span.into(), self.message.clone())
+            }
+        }
+    }
+}
+
 pub fn parse_source(source: &str) -> Result<Source, ParseError> {
     let tokens = lex(source).map_err(ParseError::from)?;
 
@@ -37,6 +57,7 @@ pub fn parse_source(source: &str) -> Result<Source, ParseError> {
 impl From<LexError> for ParseError {
     fn from(error: LexError) -> Self {
         Self {
+            kind: ParseErrorKind::Lexer,
             message: error.message,
             span: error.span,
         }
@@ -47,18 +68,22 @@ impl From<LalrpopParseError<usize, Token, LexError>> for ParseError {
     fn from(error: LalrpopParseError<usize, Token, LexError>) -> Self {
         match error {
             LalrpopParseError::InvalidToken { location } => Self {
+                kind: ParseErrorKind::Parser,
                 message: "invalid token".to_owned(),
                 span: Span::new(location, location),
             },
             LalrpopParseError::UnrecognizedEof { location, expected } => Self {
+                kind: ParseErrorKind::Parser,
                 message: expected_message("unexpected end of file", &expected),
                 span: Span::new(location, location),
             },
             LalrpopParseError::UnrecognizedToken { token, expected } => Self {
+                kind: ParseErrorKind::Parser,
                 message: expected_message(&format!("unexpected `{}`", token.1), &expected),
                 span: Span::new(token.0, token.2),
             },
             LalrpopParseError::ExtraToken { token } => Self {
+                kind: ParseErrorKind::Parser,
                 message: format!("extra token `{}`", token.1),
                 span: Span::new(token.0, token.2),
             },

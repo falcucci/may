@@ -144,6 +144,12 @@ impl fmt::Display for SemanticError {
 
 impl std::error::Error for SemanticError {}
 
+impl diagnostics::ToReport for SemanticError {
+    fn to_report(&self) -> diagnostics::Report {
+        diagnostics::Report::semantics(self.span.into(), self.message.clone())
+    }
+}
+
 pub fn check(source: &Source) -> Result<ContractDefinition, Vec<SemanticError>> {
     let mut checker = Checker::default();
     checker.collect_declarations(source);

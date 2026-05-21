@@ -1,4 +1,8 @@
+use std::path::Path;
+
 use clap::Subcommand;
+use diagnostics::Report;
+use diagnostics::ToReport;
 
 use self::check::CheckCommand;
 use self::compile::CompileCommand;
@@ -27,4 +31,24 @@ impl Commands {
             Commands::Compile(cmd) => cmd.run(),
         }
     }
+}
+
+fn render_diagnostics(path: &Path, source: &str, reports: &[Report]) {
+    let file_name = path.display().to_string();
+
+    if let Err(error) = diagnostics::render_reports(&file_name, source, reports) {
+        eprintln!(
+            "failed to render diagnostics for {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn render_error<E: ToReport>(path: &Path, source: &str, error: &E) {
+    render_diagnostics(path, source, &[error.to_report()]);
+}
+
+fn render_errors<E: ToReport>(path: &Path, source: &str, errors: &[E]) {
+    let reports = errors.iter().map(|error| error.to_report()).collect::<Vec<_>>();
+    render_diagnostics(path, source, &reports);
 }

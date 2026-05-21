@@ -3,6 +3,10 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Args;
+use diagnostics::Paint;
+
+use super::render_error;
+use super::render_errors;
 
 #[derive(Args)]
 pub struct CheckCommand {
@@ -23,7 +27,7 @@ impl CheckCommand {
         let program = match parser::parse_source(&source) {
             Ok(program) => program,
             Err(error) => {
-                eprintln!("parse error: {error}");
+                render_error(&self.path, &source, &error);
                 process::exit(1);
             }
         };
@@ -31,14 +35,13 @@ impl CheckCommand {
         match semantics::check(&program) {
             Ok(definition) => {
                 println!(
-                    "Program is semantically valid: {} declarations.",
+                    "{} {} declarations.",
+                    "Program is semantically valid:".green().bold(),
                     definition.declaration_count()
                 );
             }
             Err(errors) => {
-                for error in errors {
-                    eprintln!("semantic error: {error}");
-                }
+                render_errors(&self.path, &source, &errors);
                 process::exit(1);
             }
         };

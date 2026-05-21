@@ -297,6 +297,12 @@ impl fmt::Display for VerificationError {
 
 impl std::error::Error for VerificationError {}
 
+impl diagnostics::ToReport for VerificationError {
+    fn to_report(&self) -> diagnostics::Report {
+        diagnostics::Report::verification(self.span.into(), self.message.clone())
+    }
+}
+
 pub trait SolverBackend {
     fn check_constraint(&self, constraint: &Constraint) -> SolverResult;
     fn prove_transition(&self, proof: &TransitionProof) -> TransitionProofOutcome;
