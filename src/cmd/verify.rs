@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Args;
+use diagnostics::Paint;
 use verifier::SolverResult;
+
+use super::render_error;
+use super::render_errors;
 
 #[derive(Args)]
 pub struct VerifyCommand {
@@ -24,7 +28,7 @@ impl VerifyCommand {
         let program = match parser::parse_source(&source) {
             Ok(program) => program,
             Err(error) => {
-                eprintln!("parse error: {error}");
+                render_error(&self.path, &source, &error);
                 process::exit(1);
             }
         };
@@ -32,9 +36,7 @@ impl VerifyCommand {
         let contract = match semantics::check(&program) {
             Ok(contract) => contract,
             Err(errors) => {
-                for error in errors {
-                    eprintln!("semantic error: {error}");
-                }
+                render_errors(&self.path, &source, &errors);
                 process::exit(1);
             }
         };
@@ -42,9 +44,9 @@ impl VerifyCommand {
         match verifier::verify(&contract) {
             Ok(report) => {
                 println!(
-                    "Program verified: {} bounds checked, {} accepted, {} rejected, {} unknown, \
-                     {} unsupported; {} transition goals proved, {} failed, {} unknown, {} \
-                     unsupported.",
+                    "{} {} bounds checked, {} accepted, {} rejected, {} unknown, {} unsupported; \
+                     {} transition goals proved, {} failed, {} unknown, {} unsupported.",
+                    "Program verified:".green().bold(),
                     report.checked_bounds,
                     report.accepted_constraints(),
                     report.rejected_constraints(),
@@ -76,9 +78,7 @@ impl VerifyCommand {
                 }
             }
             Err(errors) => {
-                for error in errors {
-                    eprintln!("verification error: {error}");
-                }
+                render_errors(&self.path, &source, &errors);
                 process::exit(1);
             }
         }

@@ -19,6 +19,10 @@ impl Span {
     }
 }
 
+impl From<Span> for diagnostics::Span {
+    fn from(value: Span) -> Self { Self::new(value.start, value.end) }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LogosError {
     #[default]
@@ -176,6 +180,12 @@ impl fmt::Display for LexError {
 }
 
 impl std::error::Error for LexError {}
+
+impl diagnostics::ToReport for LexError {
+    fn to_report(&self) -> diagnostics::Report {
+        diagnostics::Report::lexer(self.span.into(), self.message.clone())
+    }
+}
 
 pub type SpannedToken = (usize, Token, usize);
 

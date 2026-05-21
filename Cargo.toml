@@ -6,6 +6,7 @@ edition = "2024"
 [workspace]
 members = [
   ".",
+  "crates/diagnostics",
   "crates/parser",
   "crates/semantics",
   "crates/verifier",
@@ -13,6 +14,7 @@ members = [
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+diagnostics = { path = "crates/diagnostics" }
 parser = { path = "crates/parser" }
 semantics = { path = "crates/semantics" }
 verifier = { path = "crates/verifier" }
