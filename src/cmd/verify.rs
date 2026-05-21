@@ -42,15 +42,20 @@ impl VerifyCommand {
             Ok(report) => {
                 println!(
                     "Program verified: {} bounds checked, {} accepted, {} rejected, {} unknown, \
-                     {} unsupported.",
+                     {} unsupported; {} transition goals proved, {} failed, {} unknown, {} \
+                     unsupported.",
                     report.checked_bounds,
                     report.accepted_constraints(),
                     report.rejected_constraints(),
                     report.unknown_constraints(),
-                    report.unsupported_constraints()
+                    report.unsupported_constraints(),
+                    report.proved_transition_goals(),
+                    report.failed_transition_goals(),
+                    report.unknown_transition_goals(),
+                    report.unsupported_transition_goals()
                 );
 
-                if report.rejected_constraints() > 0 {
+                if report.rejected_constraints() > 0 || report.failed_transition_goals() > 0 {
                     process::exit(1);
                 }
             }
