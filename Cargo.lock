@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "algorand"
+version = "0.1.0"
+dependencies = [
+ "diagnostics",
+ "parser",
+ "semantics",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -435,6 +444,7 @@ dependencies = [
 name = "may"
 version = "0.1.0"
 dependencies = [
+ "algorand",
  "clap",
  "diagnostics",
  "parser",
