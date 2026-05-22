@@ -1,0 +1,11 @@
+[package]
+name = "algorand"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+diagnostics = { path = "../diagnostics" }
+semantics = { path = "../semantics" }
+
+[dev-dependencies]
+parser = { path = "../parser" }

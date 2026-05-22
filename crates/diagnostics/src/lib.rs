@@ -52,6 +52,7 @@ pub enum DiagnosticKind {
     Parser,
     Semantics,
     Verification,
+    Emission,
 }
 
 impl fmt::Display for DiagnosticKind {
@@ -61,6 +62,7 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::Parser => write!(f, "Parser error"),
             DiagnosticKind::Semantics => write!(f, "Semantic error"),
             DiagnosticKind::Verification => write!(f, "Verification error"),
+            DiagnosticKind::Emission => write!(f, "Emission error"),
         }
     }
 }
@@ -116,6 +118,11 @@ impl Report {
     pub fn verification(span: Span, message: impl Into<String>) -> Self {
         Self::new(DiagnosticKind::Verification, Severity::Error, span, message)
             .with_note("review the bound that produced this verification error")
+    }
+
+    pub fn emission(span: Span, message: impl Into<String>) -> Self {
+        Self::new(DiagnosticKind::Emission, Severity::Error, span, message)
+            .with_note("review the construct that the backend could not emit")
     }
 
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
