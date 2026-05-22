@@ -25,7 +25,9 @@ pub struct VerificationReport {
     pub state_bounds: usize,
     pub function_bounds: usize,
     pub constraints: Vec<Constraint>,
+    pub constraint_blocks: Vec<ConstraintBlock>,
     pub solver_results: Vec<ConstraintSolverResult>,
+    pub constraint_block_results: Vec<ConstraintBlockSolverResult>,
     pub transition_proofs: Vec<TransitionProof>,
     pub transition_results: Vec<TransitionProofResult>,
 }
@@ -59,6 +61,41 @@ impl VerificationReport {
             .count()
     }
 
+    pub fn accepted_constraint_blocks(&self) -> usize {
+        self.constraint_block_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Accepted)
+            .count()
+    }
+
+    pub fn rejected_constraint_blocks(&self) -> usize {
+        self.constraint_block_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Rejected)
+            .count()
+    }
+
+    pub fn unknown_constraint_blocks(&self) -> usize {
+        self.constraint_block_results
+            .iter()
+            .filter(|result| result.result == SolverResult::Unknown)
+            .count()
+    }
+
+    pub fn unsupported_constraint_blocks(&self) -> usize {
+        self.constraint_block_results
+            .iter()
+            .filter(|result| matches!(result.result, SolverResult::Unsupported(_)))
+            .count()
+    }
+
+    pub fn diagnostics(&self) -> Vec<diagnostics::Report> {
+        self.constraint_block_results
+            .iter()
+            .filter_map(ConstraintBlockSolverResult::to_report)
+            .collect()
+    }
+
     pub fn proved_transition_goals(&self) -> usize {
         self.transition_results
             .iter()
@@ -90,9 +127,17 @@ impl VerificationReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Constraint {
+    pub id: usize,
     pub owner: BoundOwner,
     pub expression: VerifiedExpression,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintBlock {
+    pub owner: BoundOwner,
+    pub span: Span,
+    pub constraints: Vec<Constraint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +145,52 @@ pub struct ConstraintSolverResult {
     pub owner: BoundOwner,
     pub span: Span,
     pub result: SolverResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintBlockSolverResult {
+    pub owner: BoundOwner,
+    pub span: Span,
+    pub result: SolverResult,
+    pub unsat_core: Vec<UnsatCoreConstraint>,
+}
+
+impl ConstraintBlockSolverResult {
+    pub fn to_report(&self) -> Option<diagnostics::Report> {
+        if self.result != SolverResult::Rejected {
+            return None;
+        }
+
+        let mut report = diagnostics::Report::verification(
+            self.span.into(),
+            format!("{} has conflicting must bounds", self.owner),
+        )
+        .with_note("all expressions in a must block must be satisfiable together");
+
+        for constraint in &self.unsat_core {
+            report = report.with_label(
+                constraint.span.into(),
+                format!(
+                    "constraint #{} participates in this conflict",
+                    constraint.id
+                ),
+            );
+        }
+
+        Some(report)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatCoreConstraint {
+    pub id: usize,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintBlockSolverOutcome {
+    pub result: SolverResult,
+    pub unsat_core: Vec<UnsatCoreConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +361,16 @@ pub enum BoundOwner {
     Function(String),
 }
 
+impl fmt::Display for BoundOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BoundOwner::Model(name) => write!(f, "model {name}"),
+            BoundOwner::State(name) => write!(f, "state {name}"),
+            BoundOwner::Function(name) => write!(f, "function {name}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationError {
     pub message: String,
@@ -305,6 +406,7 @@ impl diagnostics::ToReport for VerificationError {
 
 pub trait SolverBackend {
     fn check_constraint(&self, constraint: &Constraint) -> SolverResult;
+    fn check_constraint_block(&self, block: &ConstraintBlock) -> ConstraintBlockSolverOutcome;
     fn prove_transition(&self, proof: &TransitionProof) -> TransitionProofOutcome;
 }
 
@@ -313,6 +415,13 @@ pub struct StructuralBackend;
 
 impl SolverBackend for StructuralBackend {
     fn check_constraint(&self, _constraint: &Constraint) -> SolverResult { SolverResult::Accepted }
+
+    fn check_constraint_block(&self, _block: &ConstraintBlock) -> ConstraintBlockSolverOutcome {
+        ConstraintBlockSolverOutcome {
+            result: SolverResult::Accepted,
+            unsat_core: Vec::new(),
+        }
+    }
 
     fn prove_transition(&self, _proof: &TransitionProof) -> TransitionProofOutcome {
         TransitionProofOutcome {
@@ -340,6 +449,60 @@ impl SolverBackend for Z3Backend {
             SatResult::Sat => SolverResult::Accepted,
             SatResult::Unsat => SolverResult::Rejected,
             SatResult::Unknown => SolverResult::Unknown,
+        }
+    }
+
+    fn check_constraint_block(&self, block: &ConstraintBlock) -> ConstraintBlockSolverOutcome {
+        let solver = Solver::new();
+        let mut assumptions = Vec::new();
+        let mut constraints_by_binding = HashMap::new();
+
+        for constraint in &block.constraints {
+            let Some(expression) = z3_bool(&constraint.expression) else {
+                return ConstraintBlockSolverOutcome {
+                    result: SolverResult::Unsupported(
+                        "constraint block contains an expression unsupported by the Z3 backend yet"
+                            .to_owned(),
+                    ),
+                    unsat_core: Vec::new(),
+                };
+            };
+
+            let binding_name = constraint_binding_name(constraint.id);
+            let binding = Bool::new_const(binding_name.as_str());
+            solver.assert(&binding.implies(&expression));
+            constraints_by_binding.insert(binding_name, (constraint.id, constraint.span));
+            assumptions.push(binding);
+        }
+
+        match solver.check_assumptions(&assumptions) {
+            SatResult::Sat => ConstraintBlockSolverOutcome {
+                result: SolverResult::Accepted,
+                unsat_core: Vec::new(),
+            },
+            SatResult::Unsat => {
+                let mut unsat_core = solver
+                    .get_unsat_core()
+                    .iter()
+                    .filter_map(|binding| {
+                        let (id, span) = constraints_by_binding.get(&binding.to_string())?;
+                        Some(UnsatCoreConstraint {
+                            id: *id,
+                            span: *span,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                unsat_core.sort_by_key(|constraint| constraint.id);
+
+                ConstraintBlockSolverOutcome {
+                    result: SolverResult::Rejected,
+                    unsat_core,
+                }
+            }
+            SatResult::Unknown => ConstraintBlockSolverOutcome {
+                result: SolverResult::Unknown,
+                unsat_core: Vec::new(),
+            },
         }
     }
 
@@ -424,6 +587,20 @@ pub fn verify_with_backend(
                 owner: constraint.owner.clone(),
                 span: constraint.span,
                 result: backend.check_constraint(constraint),
+            })
+            .collect();
+        report.constraint_block_results = report
+            .constraint_blocks
+            .iter()
+            .map(|block| {
+                let outcome = backend.check_constraint_block(block);
+
+                ConstraintBlockSolverResult {
+                    owner: block.owner.clone(),
+                    span: block.span,
+                    result: outcome.result,
+                    unsat_core: outcome.unsat_core,
+                }
             })
             .collect();
         report.transition_results = report
@@ -606,15 +783,19 @@ impl Verifier {
     }
 
     fn verify_bounds(&mut self, owner: BoundOwner, bounds: &Bounds, scope: &VerifiedScope) {
-        let constraints = self.lower_constraints(owner.clone(), bounds, scope);
-        for constraint in constraints {
-            self.report.checked_bounds += 1;
-            match &owner {
-                BoundOwner::Model(_) => self.report.model_bounds += 1,
-                BoundOwner::State(_) => self.report.state_bounds += 1,
-                BoundOwner::Function(_) => self.report.function_bounds += 1,
+        let blocks = self.lower_constraint_blocks(owner.clone(), bounds, scope);
+        for block in blocks {
+            for constraint in &block.constraints {
+                self.report.checked_bounds += 1;
+                match &owner {
+                    BoundOwner::Model(_) => self.report.model_bounds += 1,
+                    BoundOwner::State(_) => self.report.state_bounds += 1,
+                    BoundOwner::Function(_) => self.report.function_bounds += 1,
+                }
+                self.report.constraints.push(constraint.clone());
             }
-            self.report.constraints.push(constraint);
+
+            self.report.constraint_blocks.push(block);
         }
     }
 
@@ -624,46 +805,86 @@ impl Verifier {
         bounds: &Bounds,
         scope: &VerifiedScope,
     ) -> Vec<Constraint> {
-        let mut constraints = Vec::new();
+        self.lower_constraint_blocks(owner, bounds, scope)
+            .into_iter()
+            .flat_map(|block| block.constraints)
+            .collect()
+    }
+
+    fn lower_constraint_blocks(
+        &mut self,
+        owner: BoundOwner,
+        bounds: &Bounds,
+        scope: &VerifiedScope,
+    ) -> Vec<ConstraintBlock> {
+        let mut blocks = Vec::new();
 
         if !is_valid_span(bounds.span) {
             self.errors.push(VerificationError::new(
                 "bound owner has an invalid span",
                 bounds.span,
             ));
-            return constraints;
+            return blocks;
         }
 
-        for expression in &bounds.expressions {
-            let span = expression.span();
-            if !is_valid_span(span) {
+        for block in &bounds.blocks {
+            if !is_valid_span(block.span) {
                 self.errors.push(VerificationError::new(
-                    "bound expression has an invalid span",
+                    "must block has an invalid span",
+                    block.span,
+                ));
+                continue;
+            }
+
+            if block.expressions.is_empty() {
+                self.errors.push(VerificationError::new(
+                    "must block has no bound expressions",
+                    block.span,
+                ));
+                continue;
+            }
+
+            let mut constraints = Vec::new();
+            for (index, expression) in block.expressions.iter().enumerate() {
+                let span = expression.span();
+                if !is_valid_span(span) {
+                    self.errors.push(VerificationError::new(
+                        "bound expression has an invalid span",
+                        span,
+                    ));
+                    continue;
+                }
+
+                let Some(expression) = self.lower_expression(expression, scope) else {
+                    continue;
+                };
+
+                if expression.ty() != VerifiedType::Bool {
+                    self.errors.push(VerificationError::new(
+                        "bound expression must lower to bool",
+                        expression.span(),
+                    ));
+                    continue;
+                }
+
+                constraints.push(Constraint {
+                    id: index + 1,
+                    owner: owner.clone(),
                     span,
-                ));
-                continue;
+                    expression,
+                });
             }
 
-            let Some(expression) = self.lower_expression(expression, scope) else {
-                continue;
-            };
-
-            if expression.ty() != VerifiedType::Bool {
-                self.errors.push(VerificationError::new(
-                    "bound expression must lower to bool",
-                    expression.span(),
-                ));
-                continue;
+            if !constraints.is_empty() {
+                blocks.push(ConstraintBlock {
+                    owner: owner.clone(),
+                    span: block.span,
+                    constraints,
+                });
             }
-
-            constraints.push(Constraint {
-                owner: owner.clone(),
-                span,
-                expression,
-            });
         }
 
-        constraints
+        blocks
     }
 
     fn lower_expression(
@@ -1026,6 +1247,8 @@ fn states_by_name(states: &[StateDefinition]) -> HashMap<String, &StateDefinitio
 
 fn is_valid_span(span: Span) -> bool { span.start < span.end }
 
+fn constraint_binding_name(id: usize) -> String { format!("may_bound_{id}") }
+
 fn binary_operator_text(op: ast::BinaryOperator) -> &'static str {
     match op {
         ast::BinaryOperator::Equal => "==",
@@ -1050,7 +1273,9 @@ impl Default for VerificationReport {
             state_bounds: 0,
             function_bounds: 0,
             constraints: Vec::new(),
+            constraint_blocks: Vec::new(),
             solver_results: Vec::new(),
+            constraint_block_results: Vec::new(),
             transition_proofs: Vec::new(),
             transition_results: Vec::new(),
         }
@@ -1063,6 +1288,7 @@ mod tests {
     use parser::ast::Expression;
     use parser::ast::Identifier;
     use parser::ast::IntegerLiteral;
+    use semantics::BoundBlock;
     use semantics::Bounds;
     use semantics::ContractDefinition;
     use semantics::ModelDefinition;
@@ -1352,6 +1578,137 @@ must [ before.value + 1 == before.value ]
     }
 
     #[test]
+    fn z3_backend_rejects_conflicting_model_must_block() {
+        let source = parser::parse_source(
+            r#"
+model Broken {
+    value: int
+    must [
+        value > 10,
+        value < 0
+    ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 2);
+        assert_eq!(report.accepted_constraints(), 2);
+        assert_eq!(report.rejected_constraints(), 0);
+        assert_eq!(report.constraint_blocks.len(), 1);
+        assert_eq!(report.rejected_constraint_blocks(), 1);
+        assert_eq!(
+            report.constraint_block_results[0].result,
+            SolverResult::Rejected
+        );
+        assert_eq!(
+            unsat_core_ids(&report.constraint_block_results[0]),
+            vec![1, 2]
+        );
+        assert_eq!(report.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn z3_backend_rejects_conflicting_state_must_block() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Broken(Counter) {
+    must [
+        value > 10,
+        value < 0
+    ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 2);
+        assert_eq!(report.accepted_constraints(), 2);
+        assert_eq!(report.rejected_constraints(), 0);
+        assert_eq!(report.constraint_blocks.len(), 1);
+        assert_eq!(report.rejected_constraint_blocks(), 1);
+        assert_eq!(
+            report.constraint_block_results[0].owner,
+            BoundOwner::State("Broken".to_owned())
+        );
+        assert_eq!(
+            unsat_core_ids(&report.constraint_block_results[0]),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn z3_backend_rejects_conflicting_function_must_block() {
+        let source = parser::parse_source(
+            r#"
+fn broken(amount: int)
+must [
+    amount > 10,
+    amount < 0
+]
+{
+    skip;
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 2);
+        assert_eq!(report.accepted_constraints(), 2);
+        assert_eq!(report.rejected_constraints(), 0);
+        assert_eq!(report.constraint_blocks.len(), 1);
+        assert_eq!(report.rejected_constraint_blocks(), 1);
+        assert_eq!(
+            report.constraint_block_results[0].owner,
+            BoundOwner::Function("broken".to_owned())
+        );
+        assert_eq!(
+            unsat_core_ids(&report.constraint_block_results[0]),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn z3_backend_accepts_satisfiable_multi_bound_block() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+    must [
+        value >= 0,
+        value < 10
+    ]
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let report = verify(&contract).expect("contract should lower for solving");
+
+        assert_eq!(report.checked_bounds, 2);
+        assert_eq!(report.accepted_constraints(), 2);
+        assert_eq!(report.rejected_constraints(), 0);
+        assert_eq!(report.constraint_blocks.len(), 1);
+        assert_eq!(report.accepted_constraint_blocks(), 1);
+        assert_eq!(report.rejected_constraint_blocks(), 0);
+        assert!(report.diagnostics().is_empty());
+    }
+
+    #[test]
     fn rejects_malformed_bound_expression_spans() {
         let contract = ContractDefinition {
             models: vec![ModelDefinition {
@@ -1363,6 +1720,13 @@ must [ before.value + 1 == before.value ]
                         text: "0".to_owned(),
                         span: Span::new(3, 3),
                     })],
+                    blocks: vec![BoundBlock {
+                        span: Span::new(1, 2),
+                        expressions: vec![Expression::Integer(IntegerLiteral {
+                            text: "0".to_owned(),
+                            span: Span::new(3, 3),
+                        })],
+                    }],
                 },
                 span: Span::new(1, 2),
             }],
@@ -1391,6 +1755,13 @@ must [ before.value + 1 == before.value ]
                         text: "missing".to_owned(),
                         span: Span::new(3, 10),
                     })],
+                    blocks: vec![BoundBlock {
+                        span: Span::new(1, 2),
+                        expressions: vec![Expression::Identifier(Identifier {
+                            text: "missing".to_owned(),
+                            span: Span::new(3, 10),
+                        })],
+                    }],
                 },
                 span: Span::new(1, 2),
             }],
@@ -1454,5 +1825,9 @@ must [ before.value + 1 == before.value ]
             .iter()
             .find(|value| value.name == name)
             .map(|value| value.value.as_str())
+    }
+
+    fn unsat_core_ids(result: &super::ConstraintBlockSolverResult) -> Vec<usize> {
+        result.unsat_core.iter().map(|constraint| constraint.id).collect()
     }
 }

@@ -80,6 +80,13 @@ pub struct StateTransitionDefinition {
 pub struct Bounds {
     pub span: Span,
     pub expressions: Vec<Expression>,
+    pub blocks: Vec<BoundBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundBlock {
+    pub span: Span,
+    pub expressions: Vec<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -735,12 +742,18 @@ fn bounds_from_blocks<'a>(
     owner_span: Span,
     blocks: impl IntoIterator<Item = &'a ConstraintBlock>,
 ) -> Bounds {
+    let blocks = blocks
+        .into_iter()
+        .map(|block| BoundBlock {
+            span: block.span,
+            expressions: block.expressions.clone(),
+        })
+        .collect::<Vec<_>>();
+
     Bounds {
         span: owner_span,
-        expressions: blocks
-            .into_iter()
-            .flat_map(|block| block.expressions.iter().cloned())
-            .collect(),
+        expressions: blocks.iter().flat_map(|block| block.expressions.iter().cloned()).collect(),
+        blocks,
     }
 }
 
@@ -859,6 +872,7 @@ must [ amount > 0 ]
         assert_eq!(counter.fields[0].name, "value");
         assert_eq!(counter.fields[0].ty, Type::Int);
         assert_eq!(counter.bounds.expressions.len(), 1);
+        assert_eq!(counter.bounds.blocks.len(), 1);
 
         let ready = &definition.states[0];
         assert_eq!(ready.name, "Ready");
@@ -866,6 +880,7 @@ must [ amount > 0 ]
         assert_eq!(ready.fields.len(), 1);
         assert_eq!(ready.fields[0].name, "value");
         assert_eq!(ready.bounds.expressions.len(), 1);
+        assert_eq!(ready.bounds.blocks.len(), 1);
 
         let increment = &definition.functions[0];
         assert_eq!(increment.name, "increment");
@@ -895,7 +910,30 @@ must [ amount > 0 ]
             None
         );
         assert_eq!(increment.bounds.expressions.len(), 1);
+        assert_eq!(increment.bounds.blocks.len(), 1);
         assert_eq!(increment.body.len(), 1);
+    }
+
+    #[test]
+    fn preserves_must_block_shape() {
+        let source = parse_source(
+            r#"
+model Counter {
+    value: int
+    must [ value >= 0, value < 10 ]
+    must [ value != 5 ]
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let definition = check(&source).expect("source should be semantically valid");
+        let counter = &definition.models[0];
+
+        assert_eq!(counter.bounds.expressions.len(), 3);
+        assert_eq!(counter.bounds.blocks.len(), 2);
+        assert_eq!(counter.bounds.blocks[0].expressions.len(), 2);
+        assert_eq!(counter.bounds.blocks[1].expressions.len(), 1);
     }
 
     #[test]
