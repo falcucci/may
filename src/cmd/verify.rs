@@ -6,6 +6,7 @@ use clap::Args;
 use diagnostics::Paint;
 use verifier::SolverResult;
 
+use super::render_diagnostics;
 use super::render_error;
 use super::render_errors;
 
@@ -45,13 +46,20 @@ impl VerifyCommand {
             Ok(report) => {
                 println!(
                     "{} {} bounds checked, {} accepted, {} rejected, {} unknown, {} unsupported; \
-                     {} transition goals proved, {} failed, {} unknown, {} unsupported.",
+                     {} must blocks checked, {} accepted, {} rejected, {} unknown, {} \
+                     unsupported; {} transition goals proved, {} failed, {} unknown, {} \
+                     unsupported.",
                     "Program verified:".green().bold(),
                     report.checked_bounds,
                     report.accepted_constraints(),
                     report.rejected_constraints(),
                     report.unknown_constraints(),
                     report.unsupported_constraints(),
+                    report.constraint_blocks.len(),
+                    report.accepted_constraint_blocks(),
+                    report.rejected_constraint_blocks(),
+                    report.unknown_constraint_blocks(),
+                    report.unsupported_constraint_blocks(),
                     report.proved_transition_goals(),
                     report.failed_transition_goals(),
                     report.unknown_transition_goals(),
@@ -73,7 +81,15 @@ impl VerifyCommand {
                     }
                 }
 
-                if report.rejected_constraints() > 0 || report.failed_transition_goals() > 0 {
+                let diagnostics = report.diagnostics();
+                if !diagnostics.is_empty() {
+                    render_diagnostics(&self.path, &source, &diagnostics);
+                }
+
+                if report.rejected_constraints() > 0
+                    || report.rejected_constraint_blocks() > 0
+                    || report.failed_transition_goals() > 0
+                {
                     process::exit(1);
                 }
             }
