@@ -86,12 +86,28 @@ pub struct TypeName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     Skip { span: Span },
+    Assignment(AssignmentStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentStatement {
+    pub target: AssignmentTarget,
+    pub value: Expression,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentTarget {
+    pub base: Identifier,
+    pub field: Identifier,
+    pub span: Span,
 }
 
 impl Statement {
     pub fn span(&self) -> Span {
         match self {
             Statement::Skip { span } => *span,
+            Statement::Assignment(assignment) => assignment.span,
         }
     }
 }

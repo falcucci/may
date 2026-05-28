@@ -1,6 +1,7 @@
 use std::fmt;
 
 use semantics::ContractDefinition;
+use semantics::Statement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlgorandArtifacts {
@@ -73,8 +74,13 @@ pub struct AlgorandEmitter;
 impl AlgorandEmitter {
     pub fn emit(
         &self,
-        _contract: &ContractDefinition,
+        contract: &ContractDefinition,
     ) -> Result<AlgorandArtifacts, Vec<AlgorandError>> {
+        let unsupported = unsupported_body_statements(contract);
+        if !unsupported.is_empty() {
+            return Err(unsupported);
+        }
+
         Ok(AlgorandArtifacts {
             approval_teal: TealProgram::always_approve().render(),
             clear_teal: TealProgram::always_approve().render(),
@@ -84,6 +90,25 @@ impl AlgorandEmitter {
 
 pub fn emit(contract: &ContractDefinition) -> Result<AlgorandArtifacts, Vec<AlgorandError>> {
     AlgorandEmitter.emit(contract)
+}
+
+fn unsupported_body_statements(contract: &ContractDefinition) -> Vec<AlgorandError> {
+    contract
+        .functions
+        .iter()
+        .flat_map(|function| {
+            function.body.iter().filter_map(|statement| match statement {
+                Statement::Skip { .. } => None,
+                Statement::Assignment(assignment) => Some(AlgorandError {
+                    message: format!(
+                        "Algorand emission does not support assignment bodies in {} yet",
+                        function.name
+                    ),
+                    span: assignment.span.into(),
+                }),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -119,5 +144,32 @@ model Counter {
             "#pragma version 10\nint 1\nreturn\n"
         );
         assert_eq!(artifacts.clear_teal, "#pragma version 10\nint 1\nreturn\n");
+    }
+
+    #[test]
+    fn rejects_assignment_bodies_until_lowering_exists() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    after.value = before.value + amount;
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let errors = emit(&contract).expect_err("assignment bodies should not emit yet");
+
+        assert!(errors.iter().any(|error| {
+            error.message == "Algorand emission does not support assignment bodies in increment yet"
+        }));
     }
 }

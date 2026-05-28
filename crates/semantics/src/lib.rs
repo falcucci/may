@@ -49,7 +49,7 @@ pub struct FunctionDefinition {
     pub params: Vec<ParameterDefinition>,
     pub transition: Option<StateTransitionDefinition>,
     pub bounds: Bounds,
-    pub body: Vec<parser::ast::Statement>,
+    pub body: Vec<Statement>,
     pub span: Span,
 }
 
@@ -73,6 +73,35 @@ pub struct StateTransitionDefinition {
     pub from_alias: Option<String>,
     pub to: String,
     pub to_alias: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Statement {
+    Skip { span: Span },
+    Assignment(AssignmentStatement),
+}
+
+impl Statement {
+    pub fn span(&self) -> Span {
+        match self {
+            Statement::Skip { span } => *span,
+            Statement::Assignment(assignment) => assignment.span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentStatement {
+    pub target: AssignmentTarget,
+    pub value: Expression,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentTarget {
+    pub alias: String,
+    pub field: String,
     pub span: Span,
 }
 
@@ -282,6 +311,8 @@ impl Checker {
                     for block in &function.constraints {
                         self.check_must_block(&function.name, &scope, block);
                     }
+
+                    self.check_function_body(source, function, &scope);
                 }
             }
         }
@@ -343,7 +374,7 @@ impl Checker {
                         }
                     }),
                     bounds: bounds_from_blocks(function.span, function.constraints.iter()),
-                    body: function.body.clone(),
+                    body: self.body_definitions(function),
                     span: function.span,
                 }),
             }
@@ -379,6 +410,27 @@ impl Checker {
                     span: field.span,
                 }),
                 ModelItem::Constraint(_) => None,
+            })
+            .collect()
+    }
+
+    fn body_definitions(&self, function: &parser::ast::FunctionDeclaration) -> Vec<Statement> {
+        function
+            .body
+            .iter()
+            .map(|statement| match statement {
+                parser::ast::Statement::Skip { span } => Statement::Skip { span: *span },
+                parser::ast::Statement::Assignment(assignment) => {
+                    Statement::Assignment(AssignmentStatement {
+                        target: AssignmentTarget {
+                            alias: assignment.target.base.text.clone(),
+                            field: assignment.target.field.text.clone(),
+                            span: assignment.target.span,
+                        },
+                        value: assignment.value.clone(),
+                        span: assignment.span,
+                    })
+                }
             })
             .collect()
     }
@@ -553,7 +605,7 @@ impl Checker {
         block: &ConstraintBlock,
     ) {
         for expression in &block.expressions {
-            let ty = self.infer_expression(owner_name, scope, expression);
+            let ty = self.infer_expression(owner_name, scope, expression, "must block");
 
             if ty == SemanticType::Unknown {
                 continue;
@@ -568,11 +620,105 @@ impl Checker {
         }
     }
 
+    fn check_function_body(
+        &mut self,
+        source: &Source,
+        function: &parser::ast::FunctionDeclaration,
+        scope: &ExpressionScope,
+    ) {
+        for statement in &function.body {
+            match statement {
+                parser::ast::Statement::Skip { .. } => {}
+                parser::ast::Statement::Assignment(assignment) => {
+                    self.check_assignment(source, function, scope, assignment);
+                }
+            }
+        }
+    }
+
+    fn check_assignment(
+        &mut self,
+        source: &Source,
+        function: &parser::ast::FunctionDeclaration,
+        scope: &ExpressionScope,
+        assignment: &parser::ast::AssignmentStatement,
+    ) {
+        let Some(transition) = &function.transition else {
+            self.errors.push(SemanticError::new(
+                format!(
+                    "{} assignment requires a state transition",
+                    function.name.text
+                ),
+                assignment.span,
+            ));
+            return;
+        };
+
+        let Some(output_alias) = transition.to_alias.as_ref() else {
+            self.errors.push(SemanticError::new(
+                format!(
+                    "{} assignment requires an output state alias",
+                    function.name.text
+                ),
+                assignment.target.base.span,
+            ));
+            return;
+        };
+
+        if assignment.target.base.text != output_alias.text {
+            self.errors.push(SemanticError::new(
+                format!(
+                    "{} can only assign to output state alias {}",
+                    function.name.text, output_alias.text
+                ),
+                assignment.target.base.span,
+            ));
+            return;
+        }
+
+        let Some(fields) = self.state_fields_for_scope(source, &transition.to.text) else {
+            return;
+        };
+
+        let Some(field_ty) = fields.get(&assignment.target.field.text) else {
+            self.errors.push(SemanticError::new(
+                format!(
+                    "{} assignment refers to unknown output field {}.{}",
+                    function.name.text, assignment.target.base.text, assignment.target.field.text
+                ),
+                assignment.target.field.span,
+            ));
+            return;
+        };
+
+        let value_ty =
+            self.infer_expression(&function.name, scope, &assignment.value, "assignment");
+
+        if value_ty == SemanticType::Unknown {
+            return;
+        }
+
+        if !field_ty.is_compatible_with(&value_ty) {
+            self.errors.push(SemanticError::new(
+                format!(
+                    "{} assignment to {}.{} expects {}, got {}",
+                    function.name.text,
+                    assignment.target.base.text,
+                    assignment.target.field.text,
+                    field_ty.name(),
+                    value_ty.name()
+                ),
+                assignment.value.span(),
+            ));
+        }
+    }
+
     fn infer_expression(
         &mut self,
         owner_name: &Identifier,
         scope: &ExpressionScope,
         expression: &Expression,
+        context: &str,
     ) -> SemanticType {
         match expression {
             Expression::Identifier(identifier) => match scope.values.get(&identifier.text) {
@@ -580,8 +726,8 @@ impl Checker {
                 None => {
                     self.errors.push(SemanticError::new(
                         format!(
-                            "{} must block refers to unknown identifier {}",
-                            owner_name.text, identifier.text
+                            "{} {} refers to unknown identifier {}",
+                            owner_name.text, context, identifier.text
                         ),
                         identifier.span,
                     ));
@@ -592,8 +738,8 @@ impl Checker {
                 let Some(fields) = scope.fields.get(&base.text) else {
                     self.errors.push(SemanticError::new(
                         format!(
-                            "{} must block refers to unknown state alias {}",
-                            owner_name.text, base.text
+                            "{} {} refers to unknown state alias {}",
+                            owner_name.text, context, base.text
                         ),
                         base.span,
                     ));
@@ -605,8 +751,8 @@ impl Checker {
                     None => {
                         self.errors.push(SemanticError::new(
                             format!(
-                                "{} must block refers to unknown field {}.{}",
-                                owner_name.text, base.text, field.text
+                                "{} {} refers to unknown field {}.{}",
+                                owner_name.text, context, base.text, field.text
                             ),
                             field.span,
                         ));
@@ -616,8 +762,8 @@ impl Checker {
             }
             Expression::Integer(_) => SemanticType::IntegerLiteral,
             Expression::Binary { lhs, op, rhs, span } => {
-                let lhs_ty = self.infer_expression(owner_name, scope, lhs);
-                let rhs_ty = self.infer_expression(owner_name, scope, rhs);
+                let lhs_ty = self.infer_expression(owner_name, scope, lhs, context);
+                let rhs_ty = self.infer_expression(owner_name, scope, rhs, context);
 
                 if lhs_ty == SemanticType::Unknown || rhs_ty == SemanticType::Unknown {
                     return SemanticType::Unknown;
@@ -771,6 +917,20 @@ enum SemanticType {
 }
 
 impl SemanticType {
+    fn name(&self) -> String {
+        match self {
+            SemanticType::Int => "int".to_owned(),
+            SemanticType::UInt => "uint".to_owned(),
+            SemanticType::Bool => "bool".to_owned(),
+            SemanticType::String => "string".to_owned(),
+            SemanticType::Address => "address".to_owned(),
+            SemanticType::Hex => "hex".to_owned(),
+            SemanticType::Custom(name) => name.clone(),
+            SemanticType::IntegerLiteral => "integer literal".to_owned(),
+            SemanticType::Unknown => "unknown".to_owned(),
+        }
+    }
+
     fn to_type(&self) -> Option<Type> {
         match self {
             SemanticType::Int => Some(Type::Int),
@@ -826,6 +986,7 @@ fn binary_operator_text(op: BinaryOperator) -> &'static str {
 mod tests {
     use parser::parse_source;
 
+    use super::Statement;
     use super::Type;
     use super::check;
 
@@ -912,6 +1073,36 @@ must [ amount > 0 ]
         assert_eq!(increment.bounds.expressions.len(), 1);
         assert_eq!(increment.bounds.blocks.len(), 1);
         assert_eq!(increment.body.len(), 1);
+    }
+
+    #[test]
+    fn accepts_assignment_body_to_output_alias() {
+        let source = parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    after.value = before.value + amount;
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let definition = check(&source).expect("source should be semantically valid");
+        let increment = &definition.functions[0];
+
+        let [Statement::Assignment(assignment)] = increment.body.as_slice() else {
+            panic!("expected assignment body");
+        };
+
+        assert_eq!(assignment.target.alias, "after");
+        assert_eq!(assignment.target.field, "value");
     }
 
     #[test]
@@ -1267,6 +1458,101 @@ fn increment(amount: int, amount: int) must [ amount > 0 ] {
             errors
                 .iter()
                 .any(|error| error == "increment already has a parameter named amount")
+        );
+    }
+
+    #[test]
+    fn rejects_assignment_without_output_alias() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready -> Ready
+{
+    after.value = amount;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment assignment requires an output state alias")
+        );
+    }
+
+    #[test]
+    fn rejects_assignment_to_input_alias() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+{
+    before.value = amount;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "increment can only assign to output state alias after")
+        );
+    }
+
+    #[test]
+    fn rejects_assignment_to_unknown_output_field() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+{
+    after.missing = amount;
+}
+"#,
+        );
+
+        assert!(errors.iter().any(|error| {
+            error == "increment assignment refers to unknown output field after.missing"
+        }));
+    }
+
+    #[test]
+    fn rejects_assignment_type_mismatches() {
+        let errors = semantic_errors(
+            r#"
+model Counter {
+    value: int
+    enabled: bool
+}
+
+state Ready(Counter) {}
+
+fn update() when Ready as before -> Ready as after
+{
+    after.value = before.enabled;
+}
+"#,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "update assignment to after.value expects int, got bool")
         );
     }
 }

@@ -14,5 +14,5 @@ must [
     after.value == before.value + amount
 ]
 {
-    skip;
+    after.value = before.value + amount;
 }

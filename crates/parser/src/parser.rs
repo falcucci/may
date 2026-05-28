@@ -268,4 +268,42 @@ must [ after.value == before.value + amount ]
             )
         ));
     }
+
+    #[test]
+    fn parses_assignment_statements() {
+        let source = parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    after.value = before.value + amount;
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let Declaration::Function(function) = &source.declarations[2] else {
+            panic!("expected function declaration");
+        };
+
+        let [Statement::Assignment(assignment)] = function.body.as_slice() else {
+            panic!("expected assignment statement");
+        };
+
+        assert_eq!(assignment.target.base.text, "after");
+        assert_eq!(assignment.target.field.text, "value");
+        assert!(matches!(
+            &assignment.value,
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                ..
+            }
+        ));
+    }
 }
