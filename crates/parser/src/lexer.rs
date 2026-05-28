@@ -94,6 +94,8 @@ pub enum Token {
     EqualEqual,
     #[token("!=")]
     BangEqual,
+    #[token("=")]
+    Equal,
     #[token(">")]
     Greater,
     #[token("<")]
@@ -143,6 +145,7 @@ impl Token {
             Token::LessEqual => "<=",
             Token::EqualEqual => "==",
             Token::BangEqual => "!=",
+            Token::Equal => "=",
             Token::Greater => ">",
             Token::Less => "<",
             Token::Plus => "+",

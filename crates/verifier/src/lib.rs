@@ -12,6 +12,7 @@ use semantics::ModelDefinition;
 use semantics::ParameterDefinition;
 use semantics::StateDefinition;
 use semantics::StateTransitionDefinition;
+use semantics::Statement;
 use semantics::Type;
 use z3::SatResult;
 use z3::Solver;
@@ -710,13 +711,20 @@ impl Verifier {
             state_fields,
         );
 
-        assumptions.extend(self.lower_constraints(
+        assumptions.extend(self.lower_body_assignments(function, &function_scope));
+
+        let function_constraints = self.lower_constraints(
             BoundOwner::Function(function.name.clone()),
             &function.bounds,
             &function_scope,
-        ));
+        );
+        let (preconditions, postconditions) =
+            partition_function_constraints(function_constraints, to_alias);
 
-        let goals = self.transition_goals(to_alias, to_state, models);
+        assumptions.extend(preconditions);
+
+        let mut goals = postconditions;
+        goals.extend(self.transition_goals(to_alias, to_state, models));
         for goal in goals {
             self.report.transition_proofs.push(TransitionProof {
                 function: function.name.clone(),
@@ -726,6 +734,81 @@ impl Verifier {
                 goal,
             });
         }
+    }
+
+    fn lower_body_assignments(
+        &mut self,
+        function: &FunctionDefinition,
+        scope: &VerifiedScope,
+    ) -> Vec<Constraint> {
+        let mut constraints = Vec::new();
+
+        for (index, statement) in function.body.iter().enumerate() {
+            match statement {
+                Statement::Skip { .. } => {}
+                Statement::Assignment(assignment) => {
+                    let Some(expression) = self.lower_assignment(assignment, scope) else {
+                        continue;
+                    };
+
+                    constraints.push(Constraint {
+                        id: index + 1,
+                        owner: BoundOwner::Function(function.name.clone()),
+                        expression,
+                        span: assignment.span,
+                    });
+                }
+            }
+        }
+
+        constraints
+    }
+
+    fn lower_assignment(
+        &mut self,
+        assignment: &semantics::AssignmentStatement,
+        scope: &VerifiedScope,
+    ) -> Option<VerifiedExpression> {
+        let Some(fields) = scope.fields.get(&assignment.target.alias) else {
+            self.errors.push(VerificationError::new(
+                format!(
+                    "assignment refers to unknown state alias {}",
+                    assignment.target.alias
+                ),
+                assignment.target.span,
+            ));
+            return None;
+        };
+
+        let Some(ty) = fields.get(&assignment.target.field) else {
+            self.errors.push(VerificationError::new(
+                format!(
+                    "assignment refers to unknown field {}.{}",
+                    assignment.target.alias, assignment.target.field
+                ),
+                assignment.target.span,
+            ));
+            return None;
+        };
+
+        let lhs = VerifiedExpression::Identifier {
+            name: format!("{}.{}", assignment.target.alias, assignment.target.field),
+            ty: ty.clone(),
+            span: assignment.target.span,
+        };
+        let rhs = self.lower_expression(&assignment.value, scope)?;
+        let lhs_ty = lhs.ty();
+        let rhs_ty = rhs.ty();
+        let span = assignment.target.span.join(assignment.value.span());
+        let ty = self.lower_binary_type(ast::BinaryOperator::Equal, &lhs_ty, &rhs_ty, span)?;
+
+        Some(VerifiedExpression::Binary {
+            lhs: Box::new(lhs),
+            op: VerifiedBinaryOperator::Equal,
+            rhs: Box::new(rhs),
+            ty,
+            span,
+        })
     }
 
     fn add_state_assumptions(
@@ -1245,6 +1328,29 @@ fn states_by_name(states: &[StateDefinition]) -> HashMap<String, &StateDefinitio
     states.iter().map(|state| (state.name.clone(), state)).collect()
 }
 
+fn partition_function_constraints(
+    constraints: Vec<Constraint>,
+    output_alias: &str,
+) -> (Vec<Constraint>, Vec<Constraint>) {
+    constraints
+        .into_iter()
+        .partition(|constraint| !expression_mentions_alias(&constraint.expression, output_alias))
+}
+
+fn expression_mentions_alias(expression: &VerifiedExpression, alias: &str) -> bool {
+    match expression {
+        VerifiedExpression::Identifier { name, .. } => symbol_uses_alias(name, alias),
+        VerifiedExpression::Binary { lhs, rhs, .. } => {
+            expression_mentions_alias(lhs, alias) || expression_mentions_alias(rhs, alias)
+        }
+        VerifiedExpression::IntLiteral { .. } => false,
+    }
+}
+
+fn symbol_uses_alias(symbol: &str, alias: &str) -> bool {
+    symbol.strip_prefix(alias).is_some_and(|remaining| remaining.starts_with('.'))
+}
+
 fn is_valid_span(span: Span) -> bool { span.start < span.end }
 
 fn constraint_binding_name(id: usize) -> String { format!("may_bound_{id}") }
@@ -1389,7 +1495,7 @@ state Ready(Counter) {}
 fn increment(amount: int) when Ready as before -> Ready as after
 must [ after.value == before.value + amount ]
 {
-    skip;
+    after.value = before.value + amount;
 }
 "#,
         )
@@ -1408,8 +1514,8 @@ must [ after.value == before.value + amount ]
             &report.constraints[0].expression,
             "before.value"
         ));
-        assert_eq!(report.transition_proofs.len(), 0);
-        assert_eq!(report.transition_results.len(), 0);
+        assert_eq!(report.transition_proofs.len(), 1);
+        assert_eq!(report.proved_transition_goals(), 1);
     }
 
     #[test]
@@ -1431,7 +1537,7 @@ must [
     after.value == before.value + amount
 ]
 {
-    skip;
+    after.value = before.value + amount;
 }
 "#,
         )
@@ -1442,8 +1548,8 @@ must [
 
         assert_eq!(report.checked_bounds, 4);
         assert_eq!(report.accepted_constraints(), 4);
-        assert_eq!(report.transition_proofs.len(), 2);
-        assert_eq!(report.proved_transition_goals(), 2);
+        assert_eq!(report.transition_proofs.len(), 3);
+        assert_eq!(report.proved_transition_goals(), 3);
         assert_eq!(report.failed_transition_goals(), 0);
         assert_eq!(report.unsupported_transition_goals(), 0);
     }
@@ -1473,9 +1579,9 @@ must [ after.value == before.value + amount ]
 
         assert_eq!(report.checked_bounds, 2);
         assert_eq!(report.accepted_constraints(), 2);
-        assert_eq!(report.transition_proofs.len(), 1);
+        assert_eq!(report.transition_proofs.len(), 2);
         assert_eq!(report.proved_transition_goals(), 0);
-        assert_eq!(report.failed_transition_goals(), 1);
+        assert_eq!(report.failed_transition_goals(), 2);
         assert_eq!(report.transition_results[0].result, SolverResult::Rejected);
         assert!(counterexample_value(&report.transition_results[0], "amount").is_some());
         assert!(counterexample_value(&report.transition_results[0], "before.value").is_some());

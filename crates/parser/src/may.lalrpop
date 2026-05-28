@@ -160,6 +160,24 @@ Statement: ast::Statement = {
     <start:@L> "skip" ";" <end:@R> => ast::Statement::Skip {
         span: Span::new(start, end),
     },
+    <start:@L> <target:AssignmentTarget> "=" <value:Expression> ";" <end:@R> => {
+        ast::Statement::Assignment(ast::AssignmentStatement {
+            target,
+            value,
+            span: Span::new(start, end),
+        })
+    },
+};
+
+AssignmentTarget: ast::AssignmentTarget = {
+    <base:Identifier> "." <field:Identifier> => {
+        let span = base.span.join(field.span);
+        ast::AssignmentTarget {
+            base,
+            field,
+            span,
+        }
+    },
 };
 
 Expression: ast::Expression = {
@@ -292,6 +310,7 @@ extern {
         "<=" => Token::LessEqual,
         "==" => Token::EqualEqual,
         "!=" => Token::BangEqual,
+        "=" => Token::Equal,
         ">" => Token::Greater,
         "<" => Token::Less,
         "+" => Token::Plus,

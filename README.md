@@ -25,7 +25,7 @@ front end and the first verifier path._
         after.value == before.value + amount
     ]
     {
-        skip;
+        after.value = before.value + amount;
     }
 
 Run the checks:
