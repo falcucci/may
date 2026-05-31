@@ -56,6 +56,9 @@ pub enum TealInstruction {
     Multiply,
     Divide,
     Modulo,
+    Equal,
+    BranchIfNotZero(String),
+    Label(String),
     Return,
 }
 
@@ -78,6 +81,9 @@ impl fmt::Display for TealInstruction {
             TealInstruction::Multiply => write!(f, "*"),
             TealInstruction::Divide => write!(f, "/"),
             TealInstruction::Modulo => write!(f, "%"),
+            TealInstruction::Equal => write!(f, "=="),
+            TealInstruction::BranchIfNotZero(label) => write!(f, "bnz {label}"),
+            TealInstruction::Label(label) => write!(f, "{label}:"),
             TealInstruction::Return => write!(f, "return"),
         }
     }
@@ -117,13 +123,7 @@ impl AlgorandEmitter {
     ) -> Result<AlgorandArtifacts, Vec<AlgorandError>> {
         let approval = match contract.functions.as_slice() {
             [] => TealProgram::always_approve(),
-            [function] => self.emit_function(contract, function)?,
-            [_, function, ..] => {
-                return Err(vec![AlgorandError::new(
-                    "Algorand emission supports one function for now",
-                    function.span,
-                )]);
-            }
+            _ => self.emit_dispatch(contract)?,
         };
 
         Ok(AlgorandArtifacts {
@@ -132,13 +132,53 @@ impl AlgorandEmitter {
         })
     }
 
-    fn emit_function(
+    fn emit_dispatch(
         &self,
         contract: &ContractDefinition,
-        function: &FunctionDefinition,
     ) -> Result<TealProgram, Vec<AlgorandError>> {
-        let context = CompileContext::new(contract, function)?;
-        context.emit_approval()
+        let mut contexts = Vec::new();
+        let mut errors = Vec::new();
+
+        for function in &contract.functions {
+            match CompileContext::new(contract, function) {
+                Ok(context) => contexts.push(context),
+                Err(mut function_errors) => errors.append(&mut function_errors),
+            }
+        }
+
+        let mut bodies = Vec::new();
+        for context in &contexts {
+            let mut body = Vec::new();
+            match context.emit_body(&mut body) {
+                Ok(()) => bodies.push((function_label(&context.function.name), body)),
+                Err(mut body_errors) => errors.append(&mut body_errors),
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let mut instructions = vec![TealInstruction::PragmaVersion(10)];
+
+        for context in &contexts {
+            instructions.push(TealInstruction::TxnaApplicationArgs(0));
+            instructions.push(TealInstruction::ByteString(context.function.name.clone()));
+            instructions.push(TealInstruction::Equal);
+            instructions.push(TealInstruction::BranchIfNotZero(function_label(
+                &context.function.name,
+            )));
+        }
+
+        instructions.push(TealInstruction::Int(0));
+        instructions.push(TealInstruction::Return);
+
+        for (label, body) in bodies {
+            instructions.push(TealInstruction::Label(label));
+            instructions.extend(body);
+        }
+
+        Ok(TealProgram::new(instructions))
     }
 }
 
@@ -244,8 +284,7 @@ impl<'a> CompileContext<'a> {
         }
     }
 
-    fn emit_approval(&self) -> Result<TealProgram, Vec<AlgorandError>> {
-        let mut instructions = vec![TealInstruction::PragmaVersion(10)];
+    fn emit_body(&self, instructions: &mut Vec<TealInstruction>) -> Result<(), Vec<AlgorandError>> {
         let mut errors = Vec::new();
         let mut assigned_fields = Vec::<String>::new();
 
@@ -288,7 +327,7 @@ impl<'a> CompileContext<'a> {
 
                     assigned_fields.push(assignment.target.field.clone());
                     instructions.push(TealInstruction::ByteString(assignment.target.field.clone()));
-                    if let Err(error) = self.emit_expression(&assignment.value, &mut instructions) {
+                    if let Err(error) = self.emit_expression(&assignment.value, instructions) {
                         errors.push(error);
                     }
                     instructions.push(TealInstruction::AppGlobalPut);
@@ -310,7 +349,7 @@ impl<'a> CompileContext<'a> {
         instructions.push(TealInstruction::Int(1));
         instructions.push(TealInstruction::Return);
 
-        Ok(TealProgram::new(instructions))
+        Ok(())
     }
 
     fn emit_expression(
@@ -332,7 +371,7 @@ impl<'a> CompileContext<'a> {
                     ));
                 };
 
-                instructions.push(TealInstruction::TxnaApplicationArgs(index));
+                instructions.push(TealInstruction::TxnaApplicationArgs(index + 1));
                 instructions.push(TealInstruction::Btoi);
 
                 Ok(())
@@ -432,6 +471,8 @@ fn escape_teal_string(value: &str) -> String {
     })
 }
 
+fn function_label(name: &str) -> String { format!("may_fn_{name}") }
+
 fn binary_operator_text(op: BinaryOperator) -> &'static str {
     match op {
         BinaryOperator::Equal => "==",
@@ -461,16 +502,17 @@ fn type_name(ty: &Type) -> String {
 }
 
 #[cfg(test)]
+mod fixtures;
+
+#[cfg(test)]
 mod tests {
+    use super::fixtures::*;
     use super::TealProgram;
     use super::emit;
 
     #[test]
     fn renders_minimal_teal_program() {
-        assert_eq!(
-            TealProgram::always_approve().render(),
-            "#pragma version 10\nint 1\nreturn\n"
-        );
+        assert_eq!(TealProgram::always_approve().render(), ALWAYS_APPROVE_TEAL);
     }
 
     #[test]
@@ -488,11 +530,8 @@ model Counter {
 
         let artifacts = emit(&contract).expect("contract should emit");
 
-        assert_eq!(
-            artifacts.approval_teal,
-            "#pragma version 10\nint 1\nreturn\n"
-        );
-        assert_eq!(artifacts.clear_teal, "#pragma version 10\nint 1\nreturn\n");
+        assert_eq!(artifacts.approval_teal, ALWAYS_APPROVE_TEAL);
+        assert_eq!(artifacts.clear_teal, ALWAYS_APPROVE_TEAL);
     }
 
     #[test]
@@ -517,16 +556,12 @@ must [ after.value == before.value + amount ]
 
         let artifacts = emit(&contract).expect("assignment body should emit");
 
-        assert_eq!(
-            artifacts.approval_teal,
-            "#pragma version 10\nbyte \"value\"\nbyte \"value\"\napp_global_get\ntxna \
-             ApplicationArgs 0\nbtoi\n+\napp_global_put\nint 1\nreturn\n"
-        );
-        assert_eq!(artifacts.clear_teal, "#pragma version 10\nint 1\nreturn\n");
+        assert_eq!(artifacts.approval_teal, SINGLE_ASSIGNMENT_APPROVAL_TEAL);
+        assert_eq!(artifacts.clear_teal, ALWAYS_APPROVE_TEAL);
     }
 
     #[test]
-    fn rejects_multiple_functions_until_dispatch_exists() {
+    fn emits_two_function_dispatch() {
         let source = parser::parse_source(
             r#"
 model Counter {
@@ -549,13 +584,33 @@ fn decrement(amount: int) when Ready as before -> Ready as after
         .expect("source should parse");
         let contract = semantics::check(&source).expect("source should be semantically valid");
 
-        let errors = emit(&contract).expect_err("multiple functions should not emit yet");
+        let artifacts = emit(&contract).expect("multiple functions should emit");
 
-        assert!(
-            errors.iter().any(|error| {
-                error.message == "Algorand emission supports one function for now"
-            })
-        );
+        assert_eq!(artifacts.approval_teal, TWO_FUNCTION_DISPATCH_APPROVAL_TEAL);
+    }
+
+    #[test]
+    fn dispatch_falls_through_to_reject_unknown_selectors() {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+{
+    after.value = before.value + amount;
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        let artifacts = emit(&contract).expect("function should emit");
+
+        assert!(artifacts.approval_teal.contains("\nint 0\nreturn\nmay_fn_increment:\n"));
     }
 
     #[test]
