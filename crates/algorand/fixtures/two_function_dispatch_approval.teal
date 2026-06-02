@@ -1,0 +1,31 @@
+#pragma version 10
+txna ApplicationArgs 0
+byte "increment"
+==
+bnz may_fn_increment
+txna ApplicationArgs 0
+byte "decrement"
+==
+bnz may_fn_decrement
+int 0
+return
+may_fn_increment:
+byte "value"
+byte "value"
+app_global_get
+txna ApplicationArgs 1
+btoi
++
+app_global_put
+int 1
+return
+may_fn_decrement:
+byte "value"
+byte "value"
+app_global_get
+txna ApplicationArgs 1
+btoi
+-
+app_global_put
+int 1
+return
