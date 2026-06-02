@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use parser::Span;
@@ -8,11 +9,51 @@ use semantics::FunctionDefinition;
 use semantics::StateDefinition;
 use semantics::Statement;
 use semantics::Type;
+use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlgorandArtifacts {
     pub approval_teal: String,
     pub clear_teal: String,
+    pub application_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AlgorandManifest {
+    pub contract: String,
+    pub global_schema: StateSchema,
+    pub local_schema: StateSchema,
+    pub global_state: Vec<GlobalStateEntry>,
+    pub functions: Vec<FunctionEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StateSchema {
+    pub num_uints: usize,
+    pub num_byte_slices: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GlobalStateEntry {
+    pub field: String,
+    pub key: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FunctionEntry {
+    pub name: String,
+    pub selector: String,
+    pub params: Vec<FunctionParamEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FunctionParamEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub application_arg: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +170,7 @@ impl AlgorandEmitter {
         Ok(AlgorandArtifacts {
             approval_teal: approval.render(),
             clear_teal: TealProgram::always_approve().render(),
+            application_json: render_manifest(&build_manifest(contract)),
         })
     }
 
@@ -473,6 +515,74 @@ fn escape_teal_string(value: &str) -> String {
 
 fn function_label(name: &str) -> String { format!("may_fn_{name}") }
 
+fn build_manifest(contract: &ContractDefinition) -> AlgorandManifest {
+    let global_state = global_state_entries(contract);
+
+    AlgorandManifest {
+        contract: "MayContract".to_owned(),
+        global_schema: StateSchema {
+            num_uints: global_state.iter().filter(|entry| entry.ty == "uint").count(),
+            num_byte_slices: global_state.iter().filter(|entry| entry.ty == "bytes").count(),
+        },
+        local_schema: StateSchema {
+            num_uints: 0,
+            num_byte_slices: 0,
+        },
+        global_state,
+        functions: contract.functions.iter().map(function_entry).collect(),
+    }
+}
+
+fn global_state_entries(contract: &ContractDefinition) -> Vec<GlobalStateEntry> {
+    let mut fields = BTreeMap::<String, Type>::new();
+
+    for state in &contract.states {
+        for field in &state.fields {
+            fields.entry(field.name.clone()).or_insert_with(|| field.ty.clone());
+        }
+    }
+
+    fields
+        .into_iter()
+        .map(|(field, ty)| GlobalStateEntry {
+            key: field.clone(),
+            field,
+            ty: schema_type_name(&ty).to_owned(),
+        })
+        .collect()
+}
+
+fn function_entry(function: &FunctionDefinition) -> FunctionEntry {
+    FunctionEntry {
+        name: function.name.clone(),
+        selector: function.name.clone(),
+        params: function
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| FunctionParamEntry {
+                name: param.name.clone(),
+                ty: type_name(&param.ty),
+                application_arg: index + 1,
+            })
+            .collect(),
+    }
+}
+
+fn render_manifest(manifest: &AlgorandManifest) -> String {
+    let mut json =
+        serde_json::to_string_pretty(manifest).expect("Algorand manifest should serialize");
+    json.push('\n');
+    json
+}
+
+fn schema_type_name(ty: &Type) -> &'static str {
+    match ty {
+        Type::Int | Type::UInt | Type::Bool => "uint",
+        Type::String | Type::Address | Type::Hex | Type::Custom(_) => "bytes",
+    }
+}
+
 fn binary_operator_text(op: BinaryOperator) -> &'static str {
     match op {
         BinaryOperator::Equal => "==",
@@ -506,9 +616,9 @@ mod fixtures;
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::*;
     use super::TealProgram;
     use super::emit;
+    use super::fixtures::*;
 
     #[test]
     fn renders_minimal_teal_program() {
@@ -558,6 +668,7 @@ must [ after.value == before.value + amount ]
 
         assert_eq!(artifacts.approval_teal, SINGLE_ASSIGNMENT_APPROVAL_TEAL);
         assert_eq!(artifacts.clear_teal, ALWAYS_APPROVE_TEAL);
+        assert_eq!(artifacts.application_json, COUNTER_APPLICATION_JSON);
     }
 
     #[test]
