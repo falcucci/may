@@ -86,12 +86,23 @@ impl CompileCommand {
             process::exit(1);
         }
 
+        let application_path = output_dir.join("application.json");
+        if let Err(error) = fs::write(&application_path, artifacts.application_json.as_bytes()) {
+            eprintln!("failed to write {}: {error}", application_path.display());
+            process::exit(1);
+        }
+
         println!(
             "{}",
             "Successfully compiled Algorand artifacts.".green().bold()
         );
         println!("{} {}", "Approval:".cyan().bold(), approval_path.display());
         println!("{} {}", "Clear:".cyan().bold(), clear_path.display());
+        println!(
+            "{} {}",
+            "Application:".cyan().bold(),
+            application_path.display()
+        );
     }
 }
 

@@ -1,0 +1,31 @@
+{
+  "contract": "MayContract",
+  "global_schema": {
+    "num_uints": 1,
+    "num_byte_slices": 0
+  },
+  "local_schema": {
+    "num_uints": 0,
+    "num_byte_slices": 0
+  },
+  "global_state": [
+    {
+      "field": "value",
+      "key": "value",
+      "type": "uint"
+    }
+  ],
+  "functions": [
+    {
+      "name": "increment",
+      "selector": "increment",
+      "params": [
+        {
+          "name": "amount",
+          "type": "int",
+          "application_arg": 1
+        }
+      ]
+    }
+  ]
+}

@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 diagnostics = { path = "../diagnostics" }
 parser = { path = "../parser" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 semantics = { path = "../semantics" }
