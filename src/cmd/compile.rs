@@ -10,6 +10,8 @@ use super::render_diagnostics;
 use super::render_error;
 use super::render_errors;
 
+const ALGORAND_TARGET_DIR: &str = "algorand";
+
 #[derive(Args)]
 pub struct CompileCommand {
     /// May source file to compile.
@@ -107,7 +109,10 @@ impl CompileCommand {
 }
 
 fn build_dir_for(path: &Path) -> PathBuf {
-    path.parent().unwrap_or_else(|| Path::new(".")).join("build")
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("build")
+        .join(ALGORAND_TARGET_DIR)
 }
 
 fn verification_all_clear(report: &verifier::VerificationReport) -> bool {
@@ -120,4 +125,27 @@ fn verification_all_clear(report: &verifier::VerificationReport) -> bool {
         && report.failed_transition_goals() == 0
         && report.unknown_transition_goals() == 0
         && report.unsupported_transition_goals() == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::build_dir_for;
+
+    #[test]
+    fn builds_algorand_output_dir_next_to_source() {
+        assert_eq!(
+            build_dir_for(Path::new("/tmp/counter.may")),
+            Path::new("/tmp/build/algorand")
+        );
+    }
+
+    #[test]
+    fn builds_algorand_output_dir_for_relative_source() {
+        assert_eq!(
+            build_dir_for(Path::new("counter.may")),
+            Path::new("build/algorand")
+        );
+    }
 }
