@@ -1,34 +1,127 @@
-# May
+## May
 
-May is an experimental programming language for writing contracts around
-explicit state, not hidden mutation.
+This is a programming language experiment for contracts that are
+supposed to say what state they are in and what has to be true when they
+move from one state to another.
 
-The goal is simple: make the important rules part of the language itself. Data
-models, states, transitions, and invariants should be written in syntax the
-compiler can parse, check and eventually verify.
+A lot of contract bugs are really state bugs. The code moves from one
+situation to another, but the transition is implicit, scattered around the
+program or only explained in somebody's head.
 
-_This is not a usable contract language yet. Right now the project has a small
-front end and the first verifier path._
+May is trying the opposite approach. Start with the model. Give the states
+names. Put the transition in the function signature. Then put the important
+rules in the program itself, where the compiler can see them.
 
-    model Counter {
-        value: int
-        must [ value >= 0 ]
-    }
+Not in a comment above the function. Not in some separate document that gets
+stale the moment the code changes.
 
-    state Ready(Counter) {
-        must [ value >= 0 ]
-    }
+So a May program has models, named states, functions and `must` blocks.
+The `must` blocks are the interesting part: they are the facts the compiler
+can parse, the semantic checker can bind to actual names and types and the
+verifier can start proving.
 
-    fn increment(amount: int) when Ready as before -> Ready as after
-    must [
-        amount > 0,
-        after.value == before.value + amount
-    ]
-    {
-        after.value = before.value + amount;
-    }
+This is very much not a production contract language yet. It has a parser,
+a semantic pass, a Z3-backed verifier for the small subset that exists and
+an Algorand backend that can emit TEAL and a small application manifest.
+That's enough to make the shape of the project real. It is not enough to
+pretend the language is finished.
 
-Run the checks:
+Algorand is just the first backend. The build output already lives under a
+target directory because other targets should not have to share the same
+artifact names.
 
-    cargo run -- check examples/counter.may
-    cargo run -- verify examples/counter.may
+## Example
+
+There's an example counter in `examples/counter.may`
+
+```
+model Counter {
+    value: int
+
+    must [ value >= 0 ]
+}
+
+state Ready(Counter) {
+    must [ value >= 0 ]
+}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [
+    amount > 0,
+    after.value == before.value + amount
+]
+{
+    after.value = before.value + amount;
+}
+```
+
+The model says that `value` is an integer and must never be negative.
+The state repeats that bound for the `Ready` state. The function says it
+moves from one `Ready` state to another one and then states what the new
+value has to be.
+
+The body is still intentionally tiny. Right now assignments are the useful
+part, because they give the verifier and the Algorand backend something
+concrete to agree on.
+
+## Running
+
+You'll need Rust and Cargo. The repository pins the Rust toolchain, so a
+normal Cargo command should pick the right compiler if rustup is installed.
+
+The verifier uses Z3 through the Rust bindings. If the build cannot find Z3,
+install it with your package manager. On macOS that is normally:
+
+```
+brew install z3
+```
+
+Start with the help output if you want the CLI surface:
+
+```
+cargo run -- help
+```
+
+To check that the program parses and passes the semantic pass:
+
+```
+cargo run -- check examples/counter.may
+```
+
+To ask the verifier to prove the current `must` bounds and transition:
+
+```
+cargo run -- verify examples/counter.may
+```
+
+And to emit the current Algorand artifacts:
+
+```
+cargo run -- compile examples/counter.may
+```
+
+Compile runs the same front end and verifier first. If verification fails, it
+does not write artifacts.
+
+When it succeeds, it writes the target output next to the source file under
+`examples/build/algorand/`
+
+```
+approval.teal
+clear.teal
+application.json
+```
+
+The generated TEAL is deliberately simple. It dispatches on the first
+application argument, updates global state for the supported assignment
+subset and rejects calls it does not understand.
+
+## Status
+
+The language is still small on purpose. Types are limited. Expressions are
+limited. The backend is only for the subset that the verifier can make sense
+of.
+
+That is the point for now: get a boring, understandable pipeline first.
+Parse the program, bind the names, verify the facts, then emit something
+only when those steps agree.
