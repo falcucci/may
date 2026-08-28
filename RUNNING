@@ -1,0 +1,74 @@
+RUNNING MAY
+
+NAME
+
+    may - check, verify and compile May contracts
+
+SYNOPSIS
+
+    cargo run -- help
+    cargo run -- check FILE
+    cargo run -- verify FILE
+    cargo run -- compile FILE
+
+REQUIREMENTS
+
+    Rust
+    Cargo
+    Z3
+
+The project pins the Rust toolchain. If rustup is installed, cargo should
+pick the right compiler for you.
+
+The verifier uses Z3 through the Rust bindings. If the build cannot find Z3,
+install it with the system package manager.
+
+On macOS:
+
+    brew install z3
+
+COMMANDS
+
+    cargo run -- help
+
+Print the CLI surface.
+
+    cargo run -- check examples/counter.may
+
+Parse the source and run the semantic pass.
+
+    cargo run -- verify examples/counter.may
+
+Parse, bind and ask the verifier to prove the must bounds and transition.
+
+    cargo run -- compile examples/counter.may
+
+Run the same front end and verifier first. If verification fails, compile does
+not write artifacts.
+
+FILES
+
+Successful Algorand compilation writes target output next to the source file:
+
+    examples/build/algorand/
+
+That directory contains:
+
+    approval.teal
+    clear.teal
+    application.json
+
+NOTES
+
+The generated TEAL is deliberately simple. It dispatches on the first
+application argument, updates global state for the supported assignment subset
+and rejects calls it does not understand.
+
+EXIT STATUS
+
+    0
+        Success.
+
+    non-zero
+        Parse errors, semantic errors, verification failures, emission errors
+        or file-system errors.

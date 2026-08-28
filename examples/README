@@ -1,0 +1,75 @@
+MAY EXAMPLES
+============
+
+NAME
+
+    counter - minimal stateful May contract
+
+SOURCE
+
+    examples/counter.may
+
+DESCRIPTION
+
+    The counter example shows the smallest useful May shape:
+
+        model
+        state
+        fn
+        must bounds
+        assignment body
+
+    The model declares the storage shape.
+
+    The state names one valid contract state over that model.
+
+    The fn declares a transition from Ready as before to Ready as after.
+
+    The body describes the state update.
+
+    The must block describes the facts that should hold around that update.
+
+PROGRAM
+
+    model Counter {
+        value: int
+
+        must [ value >= 0 ]
+    }
+
+    state Ready(Counter) {
+        must [ value >= 0 ]
+    }
+
+    fn increment(amount: int) when Ready as before -> Ready as after
+    must [
+        amount > 0,
+        after.value == before.value + amount
+    ]
+    {
+        after.value = before.value + amount;
+    }
+
+CHECKS
+
+    value >= 0
+    amount > 0
+    after.value = before.value + amount
+    -----------------------------------  every call
+    after.value >= 0
+
+    The top half is what the caller and the body provide.
+
+    The bottom half is what the target state still requires.
+
+COMMANDS
+
+    cargo run -- check examples/counter.may
+    cargo run -- verify examples/counter.may
+    cargo run -- compile examples/counter.may
+
+FILES
+
+    examples/build/algorand/approval.teal
+    examples/build/algorand/clear.teal
+    examples/build/algorand/application.json
