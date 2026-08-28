@@ -10,12 +10,17 @@ SYNOPSIS
     cargo run -- check FILE
     cargo run -- verify FILE
     cargo run -- compile FILE
+    just algorand-counter-smoke
+    just algorand-counter-smoke ADDRESS
 
 REQUIREMENTS
 
     Rust
     Cargo
     Z3
+    Just
+    AlgoKit
+    Docker or OrbStack
 
 The project pins the Rust toolchain. If rustup is installed, cargo should
 pick the right compiler for you.
@@ -45,6 +50,62 @@ Parse, bind and ask the verifier to prove the must bounds and transition.
 
 Run the same front end and verifier first. If verification fails, compile does
 not write artifacts.
+
+    just algorand-accounts
+
+Print the LocalNet accounts known to goal. Use one funded address as the
+creator for the smoke test.
+
+    just algorand-counter-smoke
+
+Run the Algorand smoke test with the first funded LocalNet account.
+
+    just algorand-counter-smoke ADDRESS
+
+Run the same smoke test with an explicit funded creator address.
+
+ALGORAND SMOKE TEST
+
+The smoke test proves that the generated artifacts are accepted by the
+Algorand developer tooling and can be executed against a real LocalNet.
+
+It starts LocalNet, compiles the May source, asks goal to compile both TEAL
+programs, creates the application, calls the increment fn with one integer
+argument and reads global state back from the chain.
+
+The ADDRESS argument is the application creator. It must be a funded LocalNet
+account. If ADDRESS is omitted, or if the literal word ADDRESS is passed, the
+recipe asks goal for the account list and chooses the first address it sees.
+
+For example:
+
+    just algorand-counter-smoke \
+        JVSGUVZ74EMJBV3MV2S3P3O7QJXRPFNTWMEMVLS5PPS73HE64HVSDSNG5Q
+
+The last argument is the increment amount. It defaults to 5.
+
+    just algorand-counter-smoke \
+        JVSGUVZ74EMJBV3MV2S3P3O7QJXRPFNTWMEMVLS5PPS73HE64HVSDSNG5Q \
+        10
+
+Success means three separate things happened:
+
+    goal accepted approval.teal and clear.teal
+    goal created an application with one global integer slot
+    increment updated the value key in global state
+
+The final read should include a value entry. With the default amount it should
+end as:
+
+    "value": {
+        "tt": 2,
+        "ui": 5
+    }
+
+If goal cannot create the application, the recipe prints goal output before it
+exits. That matters because most failures are not May parser failures. They are
+usually a bad creator address, an unfunded account, a stopped LocalNet or TEAL
+that Algorand rejected.
 
 FILES
 
