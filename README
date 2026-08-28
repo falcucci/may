@@ -1,113 +1,131 @@
 May
 
-This is a programming language experiment for contracts that are
-supposed to say what state they are in and what has to be true when they
-move from one state to another.
+May is meant to be a smart contract language where the compiler understands
+the model, the states and the transitions before it emits code.
 
 A lot of contract bugs are really state bugs. The code moves from one
 situation to another, but the transition is implicit, scattered around the
 program or only explained in somebody's head.
 
 May is trying the opposite approach. Start with the model. Give the states
-names. Put the transition in the function signature. Then put the important
+names. Put the transition in the fn signature. Then put the important
 rules in the program itself, where the compiler can see them.
 
-Not in a comment above the function. Not in some separate document that gets
+Not in a comment above the fn. Not in some separate document that gets
 stale the moment the code changes.
 
-So a May program has models, named states, functions and `must` blocks.
+So a May program has models, named states, fns and `must` blocks.
 The `must` blocks are the interesting part: they are the facts the compiler
-can parse, the semantic checker can bind to actual names and types and the
-verifier can start proving.
+should parse, bind to actual names and types, prove statically when it can,
+then lower into runtime checks when the target needs them.
 
-This is very much not a production contract language yet. It has a parser,
-a semantic pass, a Z3-backed verifier for the small subset that exists and
-an Algorand backend that can emit TEAL and a small application manifest.
-That's enough to make the shape of the project real. It is not enough to
-pretend the language is finished.
+The end goal is not just nicer syntax for a chain backend. The goal is a
+compiler pipeline that refuses to produce deployable artifacts when the
+declared model, the declared transition and the emitted program disagree.
 
-Algorand is just the first backend. The build output already lives under a
-target directory because other targets should not have to share the same
-artifact names.
+Algorand is the first backend. Other targets should be able to use the same
+checked contract model without changing what the source program means.
 
-## Example
+## What May should prove
 
-There's an example counter in `examples/counter.may`
+The verifier should treat a contract as declarations plus transitions, not
+as a loose bag of callable entrypoints.
 
-model Counter {
-    value: int
+each declaration owns a block of facts:
 
-    must [ value >= 0 ]
-}
+    model Counter
+        |
+        v
+    value >= 0
 
-state Ready(Counter) {
-    must [ value >= 0 ]
-}
+    state Ready(Counter)
+        |
+        v
+    value >= 0
 
-fn increment(amount: int) when Ready as before -> Ready as after
-must [
-    amount > 0,
+    fn increment(...)
+        |
+        v
+    amount > 0
     after.value == before.value + amount
-]
-{
-    after.value = before.value + amount;
-}
 
-The model says that `value` is an integer and must never be negative.
-The state repeats that bound for the `Ready` state. The function says it
-moves from one `Ready` state to another one and then states what the new
-value has to be.
+A `must` block is useful only if the whole stack can be true at the same
+time:
 
-The body is still intentionally tiny. Right now assignments are the useful
-part, because they give the verifier and the Algorand backend something
-concrete to agree on.
+    fact_0
+    fact_1
+    ...
+    fact_n
+    ------  Z3
+    ok
+
+So this is bad:
+
+    must [ x > 10, x < 5 ]
+
+because the verifier reduces it to:
+
+    x > 10
+    x < 5
+    ------  Z3
+    no
+
+The end goal is transition preservation. May should take the input state,
+the fn bounds and the body effects as premises:
+
+    before.value >= 0
+    amount > 0
+    after.value = before.value + amount
+    -----------------------------------  every call
+    after.value >= 0
+
+The line means: if the top is true, the bottom must be true too.
+
+An SMT solver checks that by asking whether the opposite is possible:
+
+    before.value >= 0
+    amount > 0
+    after.value = before.value + amount
+    after.value < 0
+    -----------------------------------  find values?
+    no
+
+If the opposite is impossible, the transition preserves the target state for
+every symbolic input. If it is possible, the program made a promise the body
+does not keep.
+
+The intended pipeline is boring on purpose:
+
+    source
+      |
+      v
+    parse
+      |
+      v
+    bind names and types
+      |
+      v
+    prove must blocks
+      |
+      v
+    prove transitions
+      |
+      v
+    emit target artifacts
+
+code emission belongs at the bottom. A backend should not get to hide a bad
+model.
 
 ## Running
 
-You'll need Rust and Cargo. The repository pins the Rust toolchain, so a
-normal Cargo command should pick the right compiler if rustup is installed.
-
-The verifier uses Z3 through the Rust bindings. If the build cannot find Z3,
-install it with your package manager. On macOS that is normally:
-
-brew install z3
-
-Start with the help output if you want the CLI surface:
-
-cargo run -- help
-
-To check that the program parses and passes the semantic pass:
-
-cargo run -- check examples/counter.may
-
-To ask the verifier to prove the current `must` bounds and transition:
-
-cargo run -- verify examples/counter.may
-
-And to emit the current Algorand artifacts:
-
-cargo run -- compile examples/counter.may
-
-Compile runs the same front end and verifier first. If verification fails, it
-does not write artifacts.
-
-When it succeeds, it writes the target output next to the source file under
-`examples/build/algorand/`
-
-approval.teal
-clear.teal
-application.json
-
-The generated TEAL is deliberately simple. It dispatches on the first
-application argument, updates global state for the supported assignment
-subset and rejects calls it does not understand.
+The command notes are in RUNNING.md.
 
 ## Status
 
-The language is still small on purpose. Types are limited. Expressions are
-limited. The backend is only for the subset that the verifier can make sense
-of.
+The impl is still small on purpose. Types are limited. Expressions
+are limited. The backend is only for the subset that the verifier can make
+sense of.
 
-That is the point for now: get a boring, understandable pipeline first.
+That is the point: get a boring, understandable pipeline first.
 Parse the program, bind the names, verify the facts, then emit something
 only when those steps agree.
