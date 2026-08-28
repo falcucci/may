@@ -87,7 +87,11 @@ impl diagnostics::ToReport for AlgorandError {
 pub enum TealInstruction {
     PragmaVersion(u64),
     Int(u64),
+    IntEnum(&'static str),
     ByteString(String),
+    TxnApplicationId,
+    TxnOnCompletion,
+    TxnNumAppArgs,
     TxnaApplicationArgs(usize),
     Btoi,
     AppGlobalGet,
@@ -98,6 +102,7 @@ pub enum TealInstruction {
     Divide,
     Modulo,
     Equal,
+    GreaterThan,
     BranchIfNotZero(String),
     Label(String),
     Return,
@@ -108,9 +113,13 @@ impl fmt::Display for TealInstruction {
         match self {
             TealInstruction::PragmaVersion(version) => write!(f, "#pragma version {version}"),
             TealInstruction::Int(value) => write!(f, "int {value}"),
+            TealInstruction::IntEnum(value) => write!(f, "int {value}"),
             TealInstruction::ByteString(value) => {
                 write!(f, "byte \"{}\"", escape_teal_string(value))
             }
+            TealInstruction::TxnApplicationId => write!(f, "txn ApplicationID"),
+            TealInstruction::TxnOnCompletion => write!(f, "txn OnCompletion"),
+            TealInstruction::TxnNumAppArgs => write!(f, "txn NumAppArgs"),
             TealInstruction::TxnaApplicationArgs(index) => {
                 write!(f, "txna ApplicationArgs {index}")
             }
@@ -123,6 +132,7 @@ impl fmt::Display for TealInstruction {
             TealInstruction::Divide => write!(f, "/"),
             TealInstruction::Modulo => write!(f, "%"),
             TealInstruction::Equal => write!(f, "=="),
+            TealInstruction::GreaterThan => write!(f, ">"),
             TealInstruction::BranchIfNotZero(label) => write!(f, "bnz {label}"),
             TealInstruction::Label(label) => write!(f, "{label}:"),
             TealInstruction::Return => write!(f, "return"),
@@ -162,9 +172,11 @@ impl AlgorandEmitter {
         &self,
         contract: &ContractDefinition,
     ) -> Result<AlgorandArtifacts, Vec<AlgorandError>> {
-        let approval = match contract.functions.as_slice() {
-            [] => TealProgram::always_approve(),
-            _ => self.emit_dispatch(contract)?,
+        let approval = if contract.functions.is_empty() && global_state_entries(contract).is_empty()
+        {
+            TealProgram::always_approve()
+        } else {
+            self.emit_application(contract)?
         };
 
         Ok(AlgorandArtifacts {
@@ -174,7 +186,7 @@ impl AlgorandEmitter {
         })
     }
 
-    fn emit_dispatch(
+    fn emit_application(
         &self,
         contract: &ContractDefinition,
     ) -> Result<TealProgram, Vec<AlgorandError>> {
@@ -192,7 +204,15 @@ impl AlgorandEmitter {
         for context in &contexts {
             let mut body = Vec::new();
             match context.emit_body(&mut body) {
-                Ok(()) => bodies.push((function_label(&context.function.name), body)),
+                Ok(()) => {
+                    let label = function_label(&context.function.name);
+                    bodies.push((
+                        label,
+                        function_body_label(&context.function.name),
+                        context.function.params.len() + 1,
+                        body,
+                    ));
+                }
                 Err(mut body_errors) => errors.append(&mut body_errors),
             }
         }
@@ -202,6 +222,10 @@ impl AlgorandEmitter {
         }
 
         let mut instructions = vec![TealInstruction::PragmaVersion(10)];
+
+        emit_lifecycle_gate(&mut instructions);
+        emit_create_branch(contract, &mut instructions);
+        emit_noop_branch(&mut instructions);
 
         for context in &contexts {
             instructions.push(TealInstruction::TxnaApplicationArgs(0));
@@ -215,8 +239,15 @@ impl AlgorandEmitter {
         instructions.push(TealInstruction::Int(0));
         instructions.push(TealInstruction::Return);
 
-        for (label, body) in bodies {
+        for (label, body_label, expected_arg_count, body) in bodies {
             instructions.push(TealInstruction::Label(label));
+            instructions.push(TealInstruction::TxnNumAppArgs);
+            instructions.push(TealInstruction::Int(expected_arg_count as u64));
+            instructions.push(TealInstruction::Equal);
+            instructions.push(TealInstruction::BranchIfNotZero(body_label.clone()));
+            instructions.push(TealInstruction::Int(0));
+            instructions.push(TealInstruction::Return);
+            instructions.push(TealInstruction::Label(body_label));
             instructions.extend(body);
         }
 
@@ -513,7 +544,56 @@ fn escape_teal_string(value: &str) -> String {
     })
 }
 
+fn emit_lifecycle_gate(instructions: &mut Vec<TealInstruction>) {
+    instructions.push(TealInstruction::TxnApplicationId);
+    instructions.push(TealInstruction::Int(0));
+    instructions.push(TealInstruction::Equal);
+    instructions.push(TealInstruction::BranchIfNotZero(create_label()));
+    instructions.push(TealInstruction::TxnOnCompletion);
+    instructions.push(TealInstruction::IntEnum("NoOp"));
+    instructions.push(TealInstruction::Equal);
+    instructions.push(TealInstruction::BranchIfNotZero(noop_label()));
+    instructions.push(TealInstruction::Int(0));
+    instructions.push(TealInstruction::Return);
+}
+
+fn emit_create_branch(contract: &ContractDefinition, instructions: &mut Vec<TealInstruction>) {
+    instructions.push(TealInstruction::Label(create_label()));
+
+    for field in global_state_entries(contract) {
+        instructions.push(TealInstruction::ByteString(field.key));
+        match field.ty.as_str() {
+            "uint" => instructions.push(TealInstruction::Int(0)),
+            "bytes" => instructions.push(TealInstruction::ByteString(String::new())),
+            _ => unreachable!("schema type names are closed"),
+        }
+        instructions.push(TealInstruction::AppGlobalPut);
+    }
+
+    instructions.push(TealInstruction::Int(1));
+    instructions.push(TealInstruction::Return);
+}
+
+fn emit_noop_branch(instructions: &mut Vec<TealInstruction>) {
+    instructions.push(TealInstruction::Label(noop_label()));
+    instructions.push(TealInstruction::TxnNumAppArgs);
+    instructions.push(TealInstruction::Int(0));
+    instructions.push(TealInstruction::GreaterThan);
+    instructions.push(TealInstruction::BranchIfNotZero(dispatch_label()));
+    instructions.push(TealInstruction::Int(0));
+    instructions.push(TealInstruction::Return);
+    instructions.push(TealInstruction::Label(dispatch_label()));
+}
+
+fn create_label() -> String { "may_create".to_owned() }
+
+fn noop_label() -> String { "may_noop".to_owned() }
+
+fn dispatch_label() -> String { "may_dispatch".to_owned() }
+
 fn function_label(name: &str) -> String { format!("may_fn_{name}") }
+
+fn function_body_label(name: &str) -> String { format!("may_fn_{name}_body") }
 
 fn build_manifest(contract: &ContractDefinition) -> AlgorandManifest {
     let global_state = global_state_entries(contract);
@@ -616,9 +696,32 @@ mod fixtures;
 
 #[cfg(test)]
 mod tests {
+    use super::AlgorandArtifacts;
     use super::TealProgram;
     use super::emit;
     use super::fixtures::*;
+
+    fn emit_counter_increment() -> AlgorandArtifacts {
+        let source = parser::parse_source(
+            r#"
+model Counter {
+    value: int
+}
+
+state Ready(Counter) {}
+
+fn increment(amount: int) when Ready as before -> Ready as after
+must [ after.value == before.value + amount ]
+{
+    after.value = before.value + amount;
+}
+"#,
+        )
+        .expect("source should parse");
+        let contract = semantics::check(&source).expect("source should be semantically valid");
+
+        emit(&contract).expect("counter should emit")
+    }
 
     #[test]
     fn renders_minimal_teal_program() {
@@ -646,25 +749,7 @@ model Counter {
 
     #[test]
     fn emits_single_assignment_body() {
-        let source = parser::parse_source(
-            r#"
-model Counter {
-    value: int
-}
-
-state Ready(Counter) {}
-
-fn increment(amount: int) when Ready as before -> Ready as after
-must [ after.value == before.value + amount ]
-{
-    after.value = before.value + amount;
-}
-"#,
-        )
-        .expect("source should parse");
-        let contract = semantics::check(&source).expect("source should be semantically valid");
-
-        let artifacts = emit(&contract).expect("assignment body should emit");
+        let artifacts = emit_counter_increment();
 
         assert_eq!(artifacts.approval_teal, SINGLE_ASSIGNMENT_APPROVAL_TEAL);
         assert_eq!(artifacts.clear_teal, ALWAYS_APPROVE_TEAL);
@@ -698,6 +783,67 @@ fn decrement(amount: int) when Ready as before -> Ready as after
         let artifacts = emit(&contract).expect("multiple functions should emit");
 
         assert_eq!(artifacts.approval_teal, TWO_FUNCTION_DISPATCH_APPROVAL_TEAL);
+    }
+
+    #[test]
+    fn create_initializes_global_state() {
+        let artifacts = emit_counter_increment();
+
+        assert!(artifacts.approval_teal.contains(concat!(
+            "\nmay_create:\n",
+            "byte \"value\"\n",
+            "int 0\n",
+            "app_global_put\n",
+            "int 1\n",
+            "return\n",
+        )));
+    }
+
+    #[test]
+    fn noop_calls_require_application_args_before_dispatch() {
+        let artifacts = emit_counter_increment();
+
+        assert!(artifacts.approval_teal.contains(concat!(
+            "\nmay_noop:\n",
+            "txn NumAppArgs\n",
+            "int 0\n",
+            ">\n",
+            "bnz may_dispatch\n",
+            "int 0\n",
+            "return\n",
+            "may_dispatch:\n",
+        )));
+    }
+
+    #[test]
+    fn non_noop_calls_are_rejected() {
+        let artifacts = emit_counter_increment();
+
+        assert!(artifacts.approval_teal.contains(concat!(
+            "\ntxn OnCompletion\n",
+            "int NoOp\n",
+            "==\n",
+            "bnz may_noop\n",
+            "int 0\n",
+            "return\n",
+            "may_create:\n",
+        )));
+    }
+
+    #[test]
+    fn function_dispatch_checks_exact_argument_count() {
+        let artifacts = emit_counter_increment();
+
+        assert!(artifacts.approval_teal.contains(concat!(
+            "\nmay_fn_increment:\n",
+            "txn NumAppArgs\n",
+            "int 2\n",
+            "==\n",
+            "bnz may_fn_increment_body\n",
+            "int 0\n",
+            "return\n",
+            "may_fn_increment_body:\n",
+        )));
     }
 
     #[test]

@@ -1,4 +1,28 @@
 #pragma version 10
+txn ApplicationID
+int 0
+==
+bnz may_create
+txn OnCompletion
+int NoOp
+==
+bnz may_noop
+int 0
+return
+may_create:
+byte "value"
+int 0
+app_global_put
+int 1
+return
+may_noop:
+txn NumAppArgs
+int 0
+>
+bnz may_dispatch
+int 0
+return
+may_dispatch:
 txna ApplicationArgs 0
 byte "increment"
 ==
@@ -10,6 +34,13 @@ bnz may_fn_decrement
 int 0
 return
 may_fn_increment:
+txn NumAppArgs
+int 2
+==
+bnz may_fn_increment_body
+int 0
+return
+may_fn_increment_body:
 byte "value"
 byte "value"
 app_global_get
@@ -20,6 +51,13 @@ app_global_put
 int 1
 return
 may_fn_decrement:
+txn NumAppArgs
+int 2
+==
+bnz may_fn_decrement_body
+int 0
+return
+may_fn_decrement_body:
 byte "value"
 byte "value"
 app_global_get
